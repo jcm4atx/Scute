@@ -1,0 +1,23 @@
+# Example systemd unit: copy to /etc/systemd/system/scute.service
+[Unit]
+Description=Scute encrypted notes server
+After=network.target
+
+[Service]
+Type=simple
+User=scute
+WorkingDirectory=/opt/scute
+Environment=NODE_ENV=production
+Environment=PORT=5000
+Environment=SCUTE_DATA_DIR=/var/lib/scute
+Environment=SCUTE_REGISTRATION=open
+Environment=SCUTE_TRUST_PROXY=1
+ExecStart=/usr/bin/node dist/index.cjs
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/scute
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

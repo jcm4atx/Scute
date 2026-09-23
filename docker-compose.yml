@@ -1,0 +1,14 @@
+services:
+  scute:
+    build: .
+    image: scute:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5000:5000"   # put a TLS reverse proxy in front (see README)
+    environment:
+      SCUTE_REGISTRATION: "open"   # set to "closed" after creating your accounts
+      SCUTE_MAX_UPLOAD_MB: "200"
+      SCUTE_SESSION_DAYS: "90"
+      SCUTE_TRUST_PROXY: "1"
+    volumes:
+      - ./data:/data

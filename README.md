@@ -1,7 +1,5 @@
 # Scute
 
-A web-based replacement and update for Turtl
-
 A self-hosted, end-to-end encrypted home for notes, bookmarks, passwords, images, videos and files. Scute is a modern take on [Turtl](https://github.com/turtl/server): the same idea (private, shareable, encrypted "spaces" of notes and boards), rebuilt as a single web app that installs as a PWA and works offline.
 
 > A scute is one of the bony plates that make up a turtle's shell.
