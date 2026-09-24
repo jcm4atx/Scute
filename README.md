@@ -12,6 +12,7 @@ A self-hosted, end-to-end encrypted home for notes, bookmarks, passwords, images
 - **Spaces and boards**: spaces separate collections (Personal, Work, Family); boards group notes inside a space. Tags, type filters, full-text search (runs locally on decrypted data), sort, pinning and colors.
 - **Sharing**: invite other users on your server to a space as admin, member (read/write) or guest (read-only). Keys are sealed to the invitee's public key in the browser.
 - **Offline-first PWA**: installable on desktop and mobile, service-worker app shell, encrypted local cache, and an outbox that syncs changes when you're back online. Share target: share a link from your phone straight into Scute.
+- **Joplin Server sync**: a space can be linked to a self-hosted Joplin Server account and stay in two-way sync with the Joplin desktop and mobile apps (notebooks, notes, tags, to-dos, images and attachments).
 - **Import/export**: decrypted JSON export (with or without attachments), import of Scute exports and best-effort import of Turtl JSON backups.
 - **Tiny footprint**: one Node.js process and one SQLite file. No Postgres, no Redis.
 - Light and dark themes, device/session management, password change without re-encrypting notes, account deletion.
@@ -64,9 +65,45 @@ The slideshow button in the top bar plays every image in the current view: the s
 
 Keys: ← / → move between images, Space pauses or resumes, F toggles full screen, Esc closes. On touch screens, swipe left or right. You can choose 3, 5, 8 or 15 seconds per image and turn shuffle on.
 
+## Default space
+
+Pick which space Scute opens when it starts: open the space switcher and choose **Make default space** (the default is marked with a star), tick **Open this space when Scute starts** in a space's settings, or choose it under Settings → Account → **Default space**. Choose "The space I used last" to go back to reopening wherever you left off. The choice is stored encrypted with your account, so it follows you to every device.
+
 ## Video thumbnails
 
 Scute captures a poster frame when a video is uploaded. Videos that don't have one yet, such as older uploads or file notes holding a video, get a thumbnail the first time their card scrolls into view, and it's saved with the note (still encrypted). To pick a different frame, open the video, pause where you want, and click **Use this frame as the thumbnail**.
+
+## Joplin Server sync
+
+A **Joplin space** mirrors one Joplin Server account. Scute talks the same sync protocol as the Joplin apps, so changes made in Joplin desktop, mobile or CLI show up in Scute and the other way round.
+
+**Set it up**
+
+1. Open the space switcher → **New space**, set **Kind** to **Joplin Server sync** (the name defaults to "Joplin") and create it.
+2. Enter your Joplin Server URL (for example `https://joplin.example.com`), email and password, click **Test connection**, then **Save**.
+3. The first sync starts on its own. After that Scute syncs every 5 minutes and about 15 seconds after you change something, while the space is open. **Sync now** in the Joplin bar runs it on demand; the gear button reopens the connection settings (also under the space switcher → **Joplin connection…**).
+
+**How things map**
+
+| Joplin | Scute |
+| --- | --- |
+| Notebook (including nested notebooks) | Board (nested boards are indented in the sidebar) |
+| Note / to-do | Note (to-dos show a **To-do** badge; their status is kept) |
+| Tag | Tag |
+| Image or file embedded in a note | Shown inline in the note; files download on click |
+| Note with a source URL | Keeps the URL |
+
+Notes you create in Scute go the other way: text notes and bookmarks become Joplin notes (a bookmark's URL is the first line and the note's source URL), and image, video and file notes become a Joplin note with the file attached as a resource. Notes that aren't in a board go into a notebook named after the space. Deleting a note or board in Scute moves it to Joplin's trash; deleting or trashing it in Joplin removes it from Scute.
+
+**Good to know**
+
+- **Privacy**: Joplin Server stores notes without Scute's end-to-end encryption, so anything in a Joplin space is readable by whoever runs that server. Password notes are never sent to Joplin and stay only in Scute.
+- **Joplin encryption** must be off for that Joplin account; Scute can't read Joplin-encrypted notes and will say so.
+- **Conflicts**: if a note was changed in both places since the last sync, Joplin's version wins and your Scute edit is kept as a separate note titled "… (conflict copy)", which is also synced.
+- **Sharing**: the connection details are stored encrypted inside the space, so members who can edit the space can sync it too. Guests (read-only) see the synced notes but can't start a sync.
+- **Relay**: browsers can't call Joplin Server directly, so the Scute server relays the Joplin sync API for signed-in users (it stores nothing). That means the **Scute server** (the Docker container) must be able to reach the Joplin URL. If both run in Docker on the same host, use the public HTTPS URL or put them on a shared Docker network and use e.g. `http://joplin:22300`.
+- Joplin's own "conflicts" notebook and note revision history aren't imported. Very large Joplin libraries take a while on the first sync (every item is downloaded once per browser).
+- Limit which Joplin servers can be used with `SCUTE_JOPLIN_URLS`, or turn the feature off with `SCUTE_JOPLIN=off` (see Configuration).
 
 ## Updating
 
@@ -90,6 +127,8 @@ Scute captures a poster frame when a video is uploaded. Videos that don't have o
 | `SCUTE_MAX_UPLOAD_MB` | `200` | Maximum size of one attachment or video (after encryption). Files are decrypted in browser memory, so very large values are hard on phones. |
 | `SCUTE_SESSION_DAYS` | `90` | How long a device stays signed in |
 | `SCUTE_TRUST_PROXY` | off | Set to `1` behind a reverse proxy |
+| `SCUTE_JOPLIN` | `on` | Set to `off` to disable Joplin Server sync (the relay and the space kind) |
+| `SCUTE_JOPLIN_URLS` | any | Comma-separated list of Joplin Server URLs users may connect to, e.g. `https://joplin.example.com`. Recommended on shared servers. |
 
 ## Video notes
 
@@ -131,6 +170,8 @@ All endpoints are JSON under `/api`, authenticated with `Authorization: Bearer <
 - `PUT|DELETE /api/spaces/:id`, `PUT|DELETE /api/spaces/:id/members/:userId`, `POST /api/spaces/:id/accept`
 - `PUT|DELETE /api/boards/:id`, `PUT|DELETE /api/notes/:id`, `PUT|GET /api/files/:noteId`
 - `GET /api/users/:username/key`, `GET /api/health`
+- `GET /api/spaces/:id/tombstones` — ids of deleted notes/boards (used by Joplin sync)
+- `ANY /api/joplin/<joplin api path>` with `X-Joplin-Url` — relay to a Joplin Server's sync API
 
 ## License
 
