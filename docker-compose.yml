@@ -10,5 +10,7 @@ services:
       SCUTE_MAX_UPLOAD_MB: "200"
       SCUTE_SESSION_DAYS: "90"
       SCUTE_TRUST_PROXY: "1"
+      # SCUTE_JOPLIN_URLS: "https://joplin.example.com"   # optional allow list for Joplin Server sync
+      # SCUTE_EXTRAS: "gedcom,cycles"
     volumes:
       - ./data:/data
