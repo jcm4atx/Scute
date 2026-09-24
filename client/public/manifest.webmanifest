@@ -1,0 +1,28 @@
+{
+  "name": "Scute",
+  "short_name": "Scute",
+  "description": "Self-hosted, end-to-end encrypted notes, bookmarks, passwords and files.",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone"],
+  "background_color": "#f6f4ef",
+  "theme_color": "#2a6b58",
+  "categories": ["productivity", "utilities"],
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ],
+  "shortcuts": [
+    { "name": "New note", "url": "./?new=text", "icons": [{ "src": "icon-192.png", "sizes": "192x192" }] },
+    { "name": "New bookmark", "url": "./?new=link", "icons": [{ "src": "icon-192.png", "sizes": "192x192" }] }
+  ],
+  "share_target": {
+    "action": "./",
+    "method": "GET",
+    "params": { "title": "title", "text": "text", "url": "url" }
+  }
+}
