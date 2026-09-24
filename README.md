@@ -83,6 +83,8 @@ A **Joplin space** mirrors one Joplin Server account. Scute talks the same sync 
 2. Enter your Joplin Server URL (for example `https://joplin.example.com`), email and password, click **Test connection**, then **Save**.
 3. The first sync starts on its own. After that Scute syncs every 5 minutes and about 15 seconds after you change something, while the space is open. **Sync now** in the Joplin bar runs it on demand; the gear button reopens the connection settings (also under the space switcher → **Joplin connection…**).
 
+![](resources/main-window.png)
+
 **How things map**
 
 | Joplin | Scute |
