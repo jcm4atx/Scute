@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { FileText, Link2, KeyRound, Image as ImageIcon, Paperclip, Pin, CloudOff, Copy, Check, Film, Play, Music, Download, Loader2, AlertTriangle } from "lucide-react";
 import { captureFrame, embedFor, fmtDuration, isAudioMime, isVideoMime, isVideoNote, makeVideoPoster, type Embed } from "@/lib/media";
 import type { NoteType } from "@shared/schema";
 import type { Note } from "@/lib/vault";
 import { canWrite, useVault } from "@/lib/vault";
-import { renderMarkdown } from "@/lib/markdown";
+import { joplinRefs, renderMarkdown, resourceIdOf } from "@/lib/markdown";
 import { useToast } from "@/hooks/use-toast";
+import { BookmarkCardExtras, BookmarkCover } from "@/components/bookmarks";
+import { PluginIcon, noteTypeOf, runGuarded, sanitizeCoverSvg, toPlain, usePlugins } from "@/lib/plugins";
 
 export const NOTE_TYPES: { type: NoteType; label: string; icon: typeof FileText }[] = [
   { type: "text", label: "Note", icon: FileText },
@@ -78,9 +80,183 @@ export function CopyButton({ value, label, testId }: { value: string; label: str
   );
 }
 
-export function Markdown({ src, className = "" }: { src: string; className?: string }) {
-  return <div className={`prose-note text-sm leading-relaxed ${className}`} dangerouslySetInnerHTML={{ __html: renderMarkdown(src) }} />;
+/** Resolves Joplin resource links (":/<id>") inside Markdown. Provided by Joplin spaces. */
+export type ResourceResolver = (id: string) => Promise<{ url: string; mime: string; name: string }>;
+export const ResourceContext = createContext<ResourceResolver | null>(null);
+
+function resFail(el: HTMLElement, msg: string, retry: () => void) {
+  const box = document.createElement("span");
+  box.className = "joplin-res-error";
+  box.setAttribute("data-testid", "text-joplin-res-error");
+  box.textContent = `Couldn't load attachment: ${msg} `;
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = "Retry";
+  b.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    box.replaceWith(el);
+    retry();
+  });
+  box.appendChild(b);
+  el.replaceWith(box);
 }
+
+export function Markdown({ src, className = "", noteId = null }: { src: string; className?: string; noteId?: string | null }) {
+  const resolve = useContext(ResourceContext);
+  const ref = useRef<HTMLDivElement>(null);
+  const { rev, reg } = usePlugins(); // plug-in Markdown transforms re-render on change
+  const allNotes = useVault().notes; // post-processors may depend on other notes (e.g. wiki links)
+  const html = useMemo(() => renderMarkdown(src), [src, rev]); // eslint-disable-line
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !reg.posts.length) return;
+    for (const p of reg.posts) p.fn(el, { noteId });
+  }, [html, reg.posts, noteId, allNotes]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || !resolve) return;
+    // Tag every Joplin resource once; the tag survives effect re-runs, unlike the src.
+    el.querySelectorAll<HTMLImageElement>("img[src]").forEach((img) => {
+      const id = resourceIdOf(img.getAttribute("src"));
+      if (!id) return;
+      img.dataset.jres = id;
+      img.removeAttribute("src");
+    });
+    el.querySelectorAll<HTMLAnchorElement>("a[href]").forEach((a) => {
+      const id = resourceIdOf(a.getAttribute("href"));
+      if (!id) return;
+      a.dataset.jres = id;
+      a.removeAttribute("href");
+      a.removeAttribute("target");
+      a.classList.add("joplin-res-link");
+      a.setAttribute("role", "button");
+    });
+    const load = (img: HTMLImageElement) => {
+      const id = img.dataset.jres!;
+      img.dataset.jstate = "loading";
+      img.classList.add("joplin-res-loading");
+      resolve(id)
+        .then((r) => {
+          img.classList.remove("joplin-res-loading");
+          img.dataset.jstate = "done";
+          if (r.mime.startsWith("video/") || r.mime.startsWith("audio/")) {
+            const m = document.createElement(r.mime.startsWith("video/") ? "video" : "audio");
+            m.src = r.url;
+            m.controls = true;
+            m.preload = "metadata";
+            m.className = "joplin-res-media";
+            m.addEventListener("click", (e) => e.stopPropagation());
+            img.replaceWith(m);
+          } else if (r.mime.startsWith("image/") || r.mime === "application/octet-stream") {
+            img.src = r.url;
+          } else {
+            // Not an image (e.g. a PDF embedded with image syntax): show it as a download link
+            const a = document.createElement("a");
+            a.dataset.jres = id;
+            a.className = "joplin-res-link";
+            a.setAttribute("role", "button");
+            a.textContent = img.alt || r.name;
+            img.replaceWith(a);
+            bindLink(a);
+          }
+        })
+        .catch((e) => {
+          img.classList.remove("joplin-res-loading");
+          img.dataset.jstate = "error";
+          resFail(img, (e as Error).message || "unknown error", () => load(img));
+        });
+    };
+    const bindLink = (a: HTMLAnchorElement) => {
+      if (a.dataset.jbound) return;
+      a.dataset.jbound = "1";
+      a.addEventListener("click", async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          const r = await resolve(a.dataset.jres!);
+          const d = document.createElement("a");
+          d.href = r.url;
+          d.download = r.name;
+          d.click();
+        } catch (err) {
+          a.title = `Couldn't download: ${(err as Error).message}`;
+          a.classList.add("joplin-res-link-error");
+        }
+      });
+    };
+    el.querySelectorAll<HTMLImageElement>("img[data-jres]").forEach((img) => {
+      if (img.dataset.jstate !== "done" && img.dataset.jstate !== "loading") load(img);
+    });
+    el.querySelectorAll<HTMLAnchorElement>("a[data-jres]").forEach(bindLink);
+  }, [html, resolve]);
+  return <div ref={ref} className={`prose-note text-sm leading-relaxed ${className}`} dangerouslySetInnerHTML={{ __html: html }} />;
+}
+
+/** Card cover for Joplin notes: the first embedded image, wherever it sits in the note. */
+export function JoplinCover({ text }: { text: string }) {
+  const resolve = useContext(ResourceContext);
+  const refs = resolve ? joplinRefs(text) : [];
+  const first = refs.find((r) => r.image);
+  const files = refs.filter((r) => !r.image);
+  const [url, setUrl] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (!resolve || !first) return;
+    let live = true;
+    setErr(null);
+    resolve(first.id)
+      .then((r) => live && (r.mime.startsWith("image/") || r.mime === "application/octet-stream" ? setUrl(r.url) : setUrl(null)))
+      .catch((e) => live && setErr((e as Error).message));
+    return () => {
+      live = false;
+    };
+  }, [resolve, first?.id, tick]); // eslint-disable-line
+  if (!resolve || !refs.length) return null;
+  const moreImages = refs.filter((r) => r.image).length - 1;
+  return (
+    <>
+      {first &&
+        (url ? (
+          <div className="relative">
+            <img src={url} alt={first.name || "Image"} className="w-full object-cover max-h-80 bg-muted" data-testid="img-joplin-cover" />
+            {moreImages > 0 && <span className="absolute bottom-2 right-2 rounded bg-black/70 px-1.5 py-0.5 text-[11px] font-medium text-white">+{moreImages}</span>}
+          </div>
+        ) : err ? (
+          <div className="flex items-center gap-2 bg-muted px-4 py-3 text-xs text-muted-foreground" data-testid="text-joplin-cover-error">
+            <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+            <span className="flex-1">Couldn't load image: {err}</span>
+            <button
+              type="button"
+              className="underline"
+              onClick={(e) => {
+                e.stopPropagation();
+                setTick((t) => t + 1);
+              }}
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
+          <div className="h-40 w-full animate-pulse bg-muted" />
+        ))}
+      {files.length > 0 && (
+        <div className="flex flex-wrap gap-1 px-4 pt-3" data-testid="list-joplin-files">
+          {files.slice(0, 3).map((f) => (
+            <span key={f.id} className="inline-flex max-w-full items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
+              <Paperclip className="h-3 w-3 shrink-0" />
+              <span className="truncate">{f.name || "Attachment"}</span>
+            </span>
+          ))}
+          {files.length > 3 && <span className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">+{files.length - 3}</span>}
+        </div>
+      )}
+    </>
+  );
+}
+
+const NOT_UPLOADED = "This file never finished uploading, so only the preview is here. Edit the note to attach the file again.";
 
 export function DecryptedImage({ note, className, alt }: { note: Note; className?: string; alt: string }) {
   const v = useVault();
@@ -97,6 +273,15 @@ export function DecryptedImage({ note, className, alt }: { note: Note; className
     };
   }, [note.id, note.fileSize]); // eslint-disable-line
   if (err) return <div className="text-xs text-muted-foreground p-4">Image unavailable offline</div>;
+  if (!url && !note.fileSize && note.data.file)
+    return (
+      <div className="space-y-2" data-testid="status-file-not-uploaded">
+        {note.data.thumb && <img src={note.data.thumb} alt={alt} className={className} />}
+        <p className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+          <AlertTriangle className="h-3.5 w-3.5 shrink-0" /> {NOT_UPLOADED}
+        </p>
+      </div>
+    );
   if (!url) return note.data.thumb ? <img src={note.data.thumb} alt={alt} className={className} /> : <div className="h-40 animate-pulse bg-muted rounded-md" />;
   return <img src={url} alt={alt} className={className} />;
 }
@@ -112,6 +297,7 @@ function useDecryptedUrl(note: Note, enabled = true) {
     setUrl(null);
     setErr(null);
     setProgress(0);
+    if (enabled && !note.fileSize && note.data.file) setErr(NOT_UPLOADED);
     if (!enabled || !note.fileSize) return;
     v.getFileUrl(note, (f) => live && setProgress(f))
       .then((u) => live && setUrl(u))
@@ -214,7 +400,7 @@ export function AudioPlayer({ note, onDownload }: { note: Note; onDownload?: () 
 /**
  * Plays a YouTube / Vimeo / direct media link. Nothing is loaded from the third party until the user presses play.
  */
-export function EmbedPlayer({ embed }: { embed: Embed }) {
+export function EmbedPlayer({ embed, poster }: { embed: Embed; poster?: string | null }) {
   const [on, setOn] = useState(false);
   const [bad, setBad] = useState(false);
   if (embed.kind === "direct") {
@@ -251,11 +437,17 @@ export function EmbedPlayer({ embed }: { embed: Embed }) {
         />
       ) : (
         <button type="button" onClick={() => setOn(true)} className="shell-pattern absolute inset-0 flex flex-col items-center justify-center gap-3 text-white" data-testid="button-play-embed">
-          <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white/90 text-black shadow-lg transition-transform hover:scale-105">
+          {poster && (
+            <>
+              <img src={poster} alt="" className="absolute inset-0 h-full w-full object-cover" />
+              <span className="absolute inset-0 bg-black/45" />
+            </>
+          )}
+          <span className="relative flex h-14 w-14 items-center justify-center rounded-full bg-white/90 text-black shadow-lg transition-transform hover:scale-105">
             <Play className="h-6 w-6 translate-x-0.5" />
           </span>
-          <span className="text-sm font-medium">Play on {embed.label}</span>
-          <span className="max-w-xs px-4 text-center text-[11px] text-white/60">Loads the {embed.label} player. {embed.label} will see your IP address; your notes stay private.</span>
+          <span className="relative text-sm font-medium">Play on {embed.label}</span>
+          <span className="relative max-w-xs px-4 text-center text-[11px] text-white/60">Loads the {embed.label} player. {embed.label} will see your IP address; your notes stay private.</span>
         </button>
       )}
     </div>
@@ -334,33 +526,85 @@ function VideoPoster({ note }: { note: Note }) {
   );
 }
 
-export function NoteCard({ note, onOpen, boardName }: { note: Note; onOpen: () => void; boardName?: string }) {
+export function NoteCard({
+  note,
+  onOpen,
+  boardName,
+  selecting,
+  selected,
+  onSelect,
+  onDragStart,
+}: {
+  note: Note;
+  onOpen: () => void;
+  boardName?: string;
+  /** Selection mode: a click selects instead of opening. */
+  selecting?: boolean;
+  selected?: boolean;
+  /** Toggle this card (shift: extend a range). Ctrl/Cmd-click also starts selecting. */
+  onSelect?: (e: { shiftKey: boolean }) => void;
+  onDragStart?: (e: React.DragEvent) => void;
+}) {
   const d = note.data;
   const Icon = typeIcon(d.type);
+  usePlugins(); // plug-in note types can change the icon and card line
+  const pt = noteTypeOf(d.type);
   const sw = colorSwatch(d.color);
   return (
     <article
       role="button"
       tabIndex={0}
-      onClick={onOpen}
+      aria-pressed={selecting ? !!selected : undefined}
+      draggable={!!onDragStart}
+      onDragStart={onDragStart}
+      onClick={(e) => {
+        if (onSelect && (selecting || e.ctrlKey || e.metaKey)) {
+          e.preventDefault();
+          onSelect({ shiftKey: e.shiftKey });
+        } else onOpen();
+      }}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onOpen();
+          if (selecting && onSelect) onSelect({ shiftKey: e.shiftKey });
+          else onOpen();
         }
       }}
-      className="group relative rounded-lg border bg-card text-card-foreground overflow-hidden cursor-pointer transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      className={`group relative rounded-lg border bg-card text-card-foreground overflow-hidden cursor-pointer transition-shadow hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected ? "ring-2 ring-primary" : ""}`}
       style={sw ? { borderTopColor: sw, borderTopWidth: 3 } : undefined}
       data-testid={`card-note-${note.id}`}
     >
+      {selecting && (
+        <>
+          {/* covers links and players inside the card, so a click only selects */}
+          <span className={`absolute inset-0 z-10 ${selected ? "bg-primary/10" : "hover:bg-foreground/5"}`} aria-hidden="true" />
+        </>
+      )}
       {isVideoNote(d) && <VideoPoster note={note} />}
+      {d.type === "link" && <BookmarkCover note={note} />}
       {d.type === "image" && d.thumb && <img src={d.thumb} alt={d.title || "Image"} className="w-full object-cover max-h-80 bg-muted" loading="lazy" />}
+      {d.type === "text" && d.text && /:\/[0-9a-fA-F]{32}/.test(d.text) && <JoplinCover text={d.text} />}
+      {pt?.cardCover && <PluginCardCover note={note} />}
       <div className="p-4 space-y-2">
         <div className="flex items-start gap-2">
-          <Icon className="h-4 w-4 mt-0.5 shrink-0 text-muted-foreground" />
+          {selecting ? (
+            <span className={`mt-px flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded border-2 ${selected ? "border-primary bg-primary text-primary-foreground" : "border-muted-foreground/60 bg-background"}`} aria-hidden="true" data-testid={`check-note-${note.id}`}>
+              {selected && <Check className="h-3 w-3" strokeWidth={3.5} />}
+            </span>
+          ) : pt?.icon ? (
+            <PluginIcon icon={pt.icon} className="h-4 w-4 mt-0.5 shrink-0 text-muted-foreground" />
+          ) : (
+            <Icon className="h-4 w-4 mt-0.5 shrink-0 text-muted-foreground" />
+          )}
           <h3 className="flex-1 text-sm font-semibold leading-snug break-words" data-testid={`text-note-title-${note.id}`}>
             {d.title || (d.type === "link" ? hostOf(d.url) : d.type === "file" || d.type === "video" ? d.file?.name : "Untitled")}
           </h3>
+          {d.joplin?.props?.is_todo === "1" && (
+            <span className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${d.joplin.props.todo_completed && d.joplin.props.todo_completed !== "0" ? "bg-muted text-muted-foreground line-through" : "bg-accent text-accent-foreground"}`} data-testid={`badge-todo-${note.id}`}>
+              To-do
+            </span>
+          )}
+          <PluginBadges note={note} />
           {d.pinned && <Pin className="h-3.5 w-3.5 shrink-0 text-primary" aria-label="Pinned" />}
           {note.pending && <CloudOff className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-label="Waiting to sync" />}
         </div>
@@ -377,12 +621,14 @@ export function NoteCard({ note, onOpen, boardName }: { note: Note; onOpen: () =
             {hostOf(d.url)}
           </a>
         )}
-        {d.type === "link" && embedFor(d.url) && (
+        {d.type === "link" && (embedFor(d.url) || (d.archive && /^(video|audio)\//.test(d.file?.type || ""))) && (
           <span className="inline-flex items-center gap-1 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
             <Play className="h-3 w-3" /> Plays in Scute
           </span>
         )}
+        {d.type === "link" && <BookmarkCardExtras note={note} />}
 
+        {pt?.cardLine && <PluginCardLine note={note} />}
         {d.type === "password" && (
           <div className="rounded-md bg-muted/70 px-2 py-1.5 text-xs space-y-1">
             {d.username && (
@@ -409,8 +655,8 @@ export function NoteCard({ note, onOpen, boardName }: { note: Note; onOpen: () =
         )}
 
         {d.text && (
-          <div className="note-clamp text-muted-foreground">
-            <Markdown src={d.text.slice(0, 1500)} className="text-[13px]" />
+          <div className={`note-clamp text-muted-foreground${d.joplin ? " note-clamp-noimg" : ""}`}>
+            <Markdown src={d.text.slice(0, 1500)} className="text-[13px]" noteId={note.id} />
           </div>
         )}
 
@@ -426,5 +672,55 @@ export function NoteCard({ note, onOpen, boardName }: { note: Note; onOpen: () =
         )}
       </div>
     </article>
+  );
+}
+
+/** Small labels plug-ins add to note cards (scute.cards.addBadge). */
+function PluginBadges({ note }: { note: Note }) {
+  const { reg } = usePlugins();
+  if (!reg.badges.length) return null;
+  const out: { key: string; text: string }[] = [];
+  for (const b of reg.badges) {
+    const t = b.fn(toPlain(note, b.pluginId));
+    if (t) out.push({ key: b.uid, text: String(t).slice(0, 40) });
+  }
+  return (
+    <>
+      {out.map((b) => (
+        <span key={b.key} className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground" data-testid={`badge-plugin-${note.id}`}>
+          {b.text}
+        </span>
+      ))}
+    </>
+  );
+}
+
+/** A picture a plug-in note type draws at the top of its cards (API 4). */
+function PluginCardCover({ note }: { note: Note }) {
+  const pt = noteTypeOf(note.data.type);
+  const cover = pt?.cardCover ? (runGuarded(pt.pluginId, `${pt.title} cover`, () => pt.cardCover!(toPlain(note, pt.pluginId))) as string | null | undefined) : null;
+  if (typeof cover !== "string" || !cover) return null;
+  if (/^data:image\/(png|jpe?g|gif|webp|avif);base64,/i.test(cover)) return <img src={cover} alt="" className="w-full object-cover max-h-80 bg-muted" loading="lazy" data-testid={`cover-${note.data.type}-${note.id}`} />;
+  const html = sanitizeCoverSvg(cover);
+  if (!html) return null;
+  return <div className="plugin-cover w-full [&>svg]:block [&>svg]:w-full [&>svg]:h-auto" dangerouslySetInnerHTML={{ __html: html }} data-testid={`cover-${note.data.type}-${note.id}`} />;
+}
+
+/** The one-line summary a plug-in note type shows on its cards. */
+function PluginCardLine({ note }: { note: Note }) {
+  const pt = noteTypeOf(note.data.type);
+  const line = pt?.cardLine ? (runGuarded(pt.pluginId, `${pt.title} card`, () => pt.cardLine!(toPlain(note, pt.pluginId))) as ReturnType<NonNullable<typeof pt.cardLine>>) : null;
+  const parts = Array.isArray(line?.parts) ? line!.parts.filter((x) => typeof x === "string" && x) : [];
+  if (!line || !parts.length) return null;
+  return (
+    <p className="flex items-center gap-1.5 text-xs text-muted-foreground" data-testid={`text-${note.data.type}-line-${note.id}`}>
+      {line.dot && <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: /^#[0-9a-f]{3,8}$/i.test(line.dot) ? line.dot : undefined }} />}
+      {parts.map((x, i) => (
+        <span key={i} className="contents">
+          {i > 0 && <span aria-hidden>·</span>}
+          <span className={i === parts.length - 1 ? "truncate tabular-nums" : "tabular-nums"}>{x}</span>
+        </span>
+      ))}
+    </p>
   );
 }

@@ -1,0 +1,9 @@
+{
+  "id": "daily-note",
+  "name": "Daily note",
+  "version": "1.0.0",
+  "description": "Opens today's journal note (creating it if needed) in a Journal board. Ctrl+Shift+D, or Plug-in commands in the header.",
+  "author": "Scute",
+  "main": "main.js",
+  "permissions": ["notes:read", "notes:write", "storage"]
+}

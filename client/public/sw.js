@@ -1,6 +1,6 @@
 /* Scute service worker: offline app shell. API traffic is never cached here;
    the app keeps its own encrypted cache in IndexedDB. */
-const VERSION = "scute-1.3.0";
+const VERSION = "scute-1.17.0";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {
@@ -10,7 +10,7 @@ self.addEventListener("install", (e) => {
 
 self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches.keys().then((keys) => Promise.all(keys.filter((k) => k !== VERSION).map((k) => caches.delete(k)))).then(() => self.clients.claim()),
+    caches.keys().then((keys) => Promise.all(keys.filter((k) => !k.startsWith(VERSION)).map((k) => caches.delete(k)))).then(() => self.clients.claim()),
   );
 });
 
@@ -23,6 +23,8 @@ self.addEventListener("fetch", (e) => {
   if (req.method !== "GET") return;
   const url = new URL(req.url);
   if (url.pathname.includes("/api/")) return; // always network
+  if (url.pathname.includes("/shared/")) return; // published shares: not part of the app
+  if (/\/dav(\/|$)/.test(url.pathname)) return; // Scute Drive (WebDAV): always network, never cached
 
   // App navigations: network first, fall back to cached shell
   if (req.mode === "navigate") {
@@ -34,6 +36,22 @@ self.addEventListener("fetch", (e) => {
           return res;
         })
         .catch(() => caches.match("./index.html").then((r) => r || caches.match("./"))),
+    );
+    return;
+  }
+
+  // Plug-in files: network first so edits show up, cached copy when offline
+  if (url.origin === self.location.origin && url.pathname.includes("/plugins/")) {
+    e.respondWith(
+      fetch(req)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(VERSION + "-plugins").then((c) => c.put(req, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.open(VERSION + "-plugins").then((c) => c.match(req)).then((r) => r || Response.error())),
     );
     return;
   }

@@ -21,8 +21,25 @@ app.use((_req, res, next) => {
   res.setHeader("Referrer-Policy", "no-referrer");
   next();
 });
+// Cross-origin API access (the Joplin plug-in, scripts). The API authenticates with a
+// Bearer token, never a cookie, so allowing any origin exposes nothing a page could use
+// without already holding a token. SCUTE_API_CORS=off turns it off.
+if (!["off", "0", "false", "no"].includes((process.env.SCUTE_API_CORS || "").toLowerCase())) {
+  app.use("/api", (req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type");
+    if (req.method !== "OPTIONS") return next();
+    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Max-Age", "600");
+    res.status(204).end();
+  });
+}
+// WebDAV (Scute Drive) bodies are files: never parse them
+const notDav = (req: any) => !/^\/dav(\/|$)/.test(req.url || "");
 app.use(
   express.json({
+    type: (req) => notDav(req) && /json/i.test(String(req.headers["content-type"] || "")),
     limit: "8mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
@@ -30,7 +47,7 @@ app.use(
   }),
 );
 
-app.use(express.urlencoded({ extended: false }));
+app.use(express.urlencoded({ extended: false, type: (req) => notDav(req) && /urlencoded/i.test(String(req.headers["content-type"] || "")) }));
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {

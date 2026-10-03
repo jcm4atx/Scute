@@ -1,0 +1,9 @@
+{
+  "id": "word-count",
+  "name": "Word count",
+  "version": "1.0.0",
+  "description": "Shows word count and reading time for a note, and a small word-count badge on longer notes.",
+  "author": "Scute",
+  "main": "main.js",
+  "permissions": []
+}

@@ -1,6 +1,17 @@
 import { QueryClient, QueryFunction } from "@tanstack/react-query";
 
-export const API_BASE = "__PORT_5000__".startsWith("__") ? "" : "__PORT_5000__";
+/**
+ * Where the server is. Normally the folder the app was loaded from, so Scute also works
+ * under a path on another site (https://example.com/scute/ through a reverse proxy).
+ */
+const appDir = () => {
+  try {
+    return new URL(".", document.baseURI).pathname.replace(/\/$/, "");
+  } catch {
+    return "";
+  }
+};
+export const API_BASE = "__PORT_5000__".startsWith("__") ? appDir() : "__PORT_5000__";
 
 async function throwIfResNotOk(res: Response) {
   if (!res.ok) {

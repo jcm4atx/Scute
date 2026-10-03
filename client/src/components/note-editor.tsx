@@ -31,8 +31,13 @@ import {
   fmtBytes,
   hostOf,
 } from "./note-parts";
-import { isImageNote, audioDuration, detectType, embedFor, fmtDuration, guessMime, isAudioMime, isVideoMime, makeVideoPoster } from "@/lib/media";
+import { isImageNote, audioDuration, describeFile, detectType, embedFor, fmtDuration, guessMime, isAudioMime, isVideoMime, makeThumb, makeVideoPoster } from "@/lib/media";
 import { api } from "@/lib/api";
+import { hexOf, resourceFile } from "@/lib/joplin";
+import { joplinRefs } from "@/lib/markdown";
+import { PluginNoteActions } from "@/components/plugin-ui";
+import { afterBookmarkSave, ARCHIVE_PREF, archivePref, BookmarkView, DuplicateWarning } from "@/components/bookmarks";
+import { buildPreview, canArchive, urlKey, webEnabled, type LinkPreview } from "@/lib/web";
 
 let maxUploadMb: number | null = null;
 async function getMaxUploadMb() {
@@ -67,23 +72,6 @@ function genPassword(len = 20) {
   return out.join("");
 }
 
-async function makeThumb(file: File): Promise<{ thumb: string; width: number; height: number } | null> {
-  try {
-    const bmp = await createImageBitmap(file);
-    const scale = Math.min(1, 560 / Math.max(bmp.width, bmp.height));
-    const c = document.createElement("canvas");
-    c.width = Math.round(bmp.width * scale);
-    c.height = Math.round(bmp.height * scale);
-    const ctx = c.getContext("2d")!;
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, c.width, c.height);
-    ctx.drawImage(bmp, 0, 0, c.width, c.height);
-    return { thumb: c.toDataURL("image/jpeg", 0.72), width: bmp.width, height: bmp.height };
-  } catch {
-    return null;
-  }
-}
-
 const blank = (type: NoteType): NoteData => ({
   type,
   title: "",
@@ -100,27 +88,107 @@ const blank = (type: NoteType): NoteData => ({
   modified: Date.now(),
 });
 
-/** Build the note fields (type, title, metadata, thumbnail) for one attachment. */
-async function describeFile(f: File): Promise<Pick<NoteData, "type" | "title" | "file" | "thumb">> {
-  const type = detectType(f);
-  const meta: FileMeta = { name: f.name, type: f.type || guessMime(f.name), size: f.size };
-  const title = f.name.replace(/\.[^.]+$/, "");
-  if (type === "image") {
-    const t = await makeThumb(f);
-    return { type, title, file: { ...meta, width: t?.width, height: t?.height }, thumb: t?.thumb || null };
+/**
+ * Move a note out of a Joplin space. Its photos and files live on the Joplin Server
+ * (":/<resource id>" links), so they're copied into Scute first:
+ *  - a note that is just one attachment (a photo note from Joplin mobile, say) becomes
+ *    an image/video/file note with that attachment;
+ *  - otherwise each attachment becomes its own note next to it, and the links in the
+ *    text point at those notes, so the pictures still show inline.
+ * The note gets a new id and the old one is deleted, so the next Joplin sync moves it to
+ * Joplin's trash instead of leaving a copy behind (Scute ids double as Joplin ids).
+ */
+/** Connection settings of every Joplin space this user can see (for notes moved out earlier). */
+function joplinConfigs(v: ReturnType<typeof useVault>) {
+  if (!v.extras.includes("joplin")) return [];
+  return v.spaces.filter((s) => s.data.kind === "joplin" && s.data.joplin?.url && s.data.joplin.email && s.data.joplin.password).map((s) => s.data.joplin!);
+}
+
+/** Joplin attachment links in a note outside Joplin spaces that nothing in Scute answers. */
+function strandedRefs(v: ReturnType<typeof useVault>, n: Note | undefined) {
+  if (!n || n.data.type !== "text" || !n.data.text) return [];
+  if (v.spaces.find((s) => s.id === n.spaceId)?.data.kind === "joplin") return [];
+  const local = new Set(v.notes.map((x) => hexOf(x.id)));
+  return joplinRefs(n.data.text).filter((r) => !local.has(r.id));
+}
+
+export async function moveFromJoplin(
+  v: ReturnType<typeof useVault>,
+  existing: Note,
+  to: { spaceId: string; boardId: string | null },
+  input: NoteData,
+  picked: File | null,
+  keepId = false, // repair a note that was moved before attachments were copied
+): Promise<{ id: string; copied: number; missing: string[] }> {
+  const from = v.spaces.find((s) => s.id === existing.spaceId);
+  const cfgs = keepId ? joplinConfigs(v) : from?.data.joplin ? [from.data.joplin] : [];
+  const data: NoteData = { ...input };
+  delete data.joplin;
+  // the note's own Scute attachment (image/video/file notes, saved bookmark copies)
+  let own: File | null = picked;
+  if (!own && !keepId && existing.fileSize && data.file) own = new File([await v.fileBlob(existing)], data.file.name, { type: data.file.type });
+  const noteIds = new Set(v.notes.filter((n) => (keepId ? true : n.spaceId === existing.spaceId)).map((n) => hexOf(n.id)));
+  const refs = joplinRefs(data.text || "").filter((r) => r.id !== existing.data.joplin?.resId && !noteIds.has(r.id)); // skip links to other notes
+  const files = new Map<string, File>();
+  const missing: string[] = [];
+  for (const r of refs) {
+    if (!cfgs.length) throw new Error(keepId ? "None of your Joplin spaces is connected to a Joplin Server." : `Connect “${from?.data.title || "the Joplin space"}” to its Joplin Server first, so its attachments can be copied.`);
+    try {
+      let got: File | null = null, err: unknown = null;
+      for (const cfg of cfgs) {
+        try {
+          got = await resourceFile(cfg, r.id);
+          break;
+        } catch (e) {
+          if (!err || (err as { status?: number }).status === 404) err = e;
+        }
+      }
+      if (!got) throw err;
+      files.set(r.id, got);
+    } catch (e) {
+      // not on the server (never uploaded): nothing to copy. Anything else: stop, move nothing.
+      if ((e as { status?: number }).status === 404) missing.push(r.name || r.id);
+      else throw new Error(`Couldn't copy the attachment “${r.name || r.id}” from Joplin: ${(e as Error).message}. The note wasn't moved.`);
+    }
   }
-  if (type === "video") {
-    const p = await makeVideoPoster(f);
-    return { type, title, file: { ...meta, width: p?.width, height: p?.height, duration: p?.duration }, thumb: p?.thumb || null };
+  const text = data.text || "";
+  const refRe = (id: string) => new RegExp(`:\\/${id}`, "gi");
+  const found = [...files.keys()];
+  const only = !own && data.type === "text" && found.length === 1 && refs.length === 1;
+  let stripped = "";
+  if (only) {
+    const id = found[0];
+    stripped = text
+      .replace(new RegExp(`!?\\[[^\\]]*\\]\\(\\s*<?:\\/${id}[^)]*\\)`, "gi"), "")
+      .replace(new RegExp(`<img\\b[^>]*?\\bsrc\\s*=\\s*["']:\\/${id}[^>]*>`, "gi"), "")
+      .replace(new RegExp(`<a\\b[^>]*?\\bhref\\s*=\\s*["']:\\/${id}[^>]*>[^<]*<\\/a>`, "gi"), "")
+      .trim();
   }
-  if (isAudioMime(meta.type)) return { type, title, file: { ...meta, duration: await audioDuration(f) }, thumb: null };
-  return { type, title: f.name, file: meta, thumb: null };
+  const newId = keepId ? existing.id : crypto.randomUUID();
+  if (only && !/:\/[0-9a-fA-F]{32}/.test(stripped)) {
+    // the note is the attachment: keep it as one image/video/file note
+    const f = files.get(found[0])!;
+    const info = await describeFile(f);
+    await v.saveNote({ id: newId, spaceId: to.spaceId, boardId: to.boardId, data: { ...data, ...info, title: data.title || info.title, text: stripped }, file: f });
+  } else {
+    let out = text;
+    for (const [rid, f] of files) {
+      const info = await describeFile(f);
+      const now = Date.now();
+      const aid = crypto.randomUUID();
+      await v.saveNote({ id: aid, spaceId: to.spaceId, boardId: to.boardId, data: { ...blank(info.type), ...info, tags: data.tags, created: now, modified: now }, file: f });
+      out = out.replace(refRe(rid), `:/${hexOf(aid)}`);
+    }
+    await v.saveNote({ id: newId, spaceId: to.spaceId, boardId: to.boardId, data: { ...data, text: out }, file: own });
+  }
+  if (!keepId) await v.deleteNote(existing.id);
+  return { id: newId, copied: files.size, missing };
 }
 
 const fileKey = (f: File) => `${f.name}:${f.size}:${f.lastModified}`;
 
 
-export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTarget | null; onClose: () => void; onSlideshow?: (note: Note) => void }) {
+export function NoteEditor({ target, onClose, onSlideshow, onOpenNote }: { target: EditorTarget | null; onClose: () => void; onSlideshow?: (note: Note) => void; onOpenNote?: (note: Note) => void }) {
   const v = useVault();
   const { toast } = useToast();
   const open = !!target;
@@ -175,6 +243,43 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
   const tagSuggestions = tagDraft ? allTags.filter((t) => t.startsWith(tagDraft.toLowerCase()) && !d.tags.includes(t)).slice(0, 5) : [];
 
   const set = <K extends keyof NoteData>(k: K, val: NoteData[K]) => setD((x) => ({ ...x, [k]: val }));
+
+  // bookmarks: live preview while typing the URL, and the "save a copy" option
+  const [saveCopy, setSaveCopy] = useState(archivePref);
+  const [lp, setLp] = useState<(LinkPreview & { thumb: string | null; forUrl: string }) | null>(null);
+  const [lpBusy, setLpBusy] = useState(false);
+  const [webOn, setWebOn] = useState(false);
+  const titleTouched = useRef(false);
+  useEffect(() => {
+    void webEnabled().then(setWebOn);
+  }, []);
+  useEffect(() => {
+    setLp(null);
+    titleTouched.current = false;
+  }, [target]);
+  const normUrl = (u?: string) => (u && !/^[a-z][a-z0-9+.-]*:/i.test(u.trim()) ? "https://" + u.trim() : u?.trim() || "");
+  useEffect(() => {
+    if (!editing || d.type !== "link" || !webOn || !v.online) return;
+    const u = normUrl(d.url);
+    if (!/^https?:\/\/[^/\s]+\.[^/\s]+/i.test(u) || lp?.forUrl === u) return;
+    if (existing && urlKey(existing.data.url) === urlKey(u) && existing.data.preview) return;
+    const ac = new AbortController();
+    const t = setTimeout(() => {
+      setLpBusy(true);
+      buildPreview(u, ac.signal)
+        .then((p) => {
+          setLp({ ...p, forUrl: u });
+          if (p.title && !titleTouched.current) setD((x) => (x.title ? x : { ...x, title: p.title! }));
+        })
+        .catch(() => undefined)
+        .finally(() => !ac.signal.aborted && setLpBusy(false));
+    }, 700);
+    return () => {
+      clearTimeout(t);
+      ac.abort();
+      setLpBusy(false);
+    };
+  }, [d.url, d.type, editing, webOn, v.online]); // eslint-disable-line
   const addTag = (raw: string) => {
     const t = raw.trim().replace(/^#/, "").toLowerCase();
     if (t && !d.tags.includes(t)) set("tags", [...d.tags, t]);
@@ -346,8 +451,36 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
     const url = d.url && !/^[a-z][a-z0-9+.-]*:/i.test(d.url.trim()) ? "https://" + d.url.trim() : d.url?.trim();
     setBusy(true);
     try {
-      const data: NoteData = { ...d, url, tags: tagDraft.trim() ? [...new Set([...d.tags, tagDraft.trim().toLowerCase()])] : d.tags, modified: Date.now() };
-      await v.saveNote({ id: existing?.id, spaceId, boardId: spaceBoards.some((b) => b.id === boardId) ? boardId : null, data, file });
+      let data: NoteData = { ...d, url, tags: tagDraft.trim() ? [...new Set([...d.tags, tagDraft.trim().toLowerCase()])] : d.tags, modified: Date.now() };
+      let bm: { preview: boolean; archive: boolean } | null = null;
+      if (data.type === "link") {
+        // a copy may have been saved in the background while this was open
+        const cur = existing ? v.notes.find((n) => n.id === existing.id)?.data : undefined;
+        const same = !!existing && urlKey(existing.data.url) === urlKey(url);
+        data = { ...data, file: cur?.file ?? data.file, archive: cur?.archive ?? data.archive };
+        if (lp && lp.forUrl === url) data = { ...data, thumb: lp.thumb || null, preview: { kind: lp.kind, site: lp.site, description: lp.description, image: lp.image, checked: Date.now() } };
+        else if (same) data = { ...data, thumb: cur?.thumb ?? data.thumb, preview: cur?.preview ?? data.preview };
+        else data = { ...data, thumb: null, preview: undefined };
+        bm = { preview: !data.preview, archive: webOn && saveCopy && (!same || !data.archive) };
+      }
+      const toBoard = spaceBoards.some((b) => b.id === boardId) ? boardId : null;
+      const fromJoplin = !!existing && existing.spaceId !== spaceId && v.spaces.find((s) => s.id === existing.spaceId)?.data.kind === "joplin";
+      let moved: Awaited<ReturnType<typeof moveFromJoplin>> | null = null;
+      if (existing && existing.spaceId !== spaceId) delete data.joplin; // new to the target space (and to its Joplin account, if any)
+      if (fromJoplin) moved = await moveFromJoplin(v, existing!, { spaceId, boardId: toBoard }, data, file);
+      const savedId = moved ? moved.id : await v.saveNote({ id: existing?.id, spaceId, boardId: toBoard, data, file });
+      if (moved && !extras.length) {
+        toast({
+          title: "Moved",
+          description:
+            (moved.copied ? `Copied ${moved.copied} attachment${moved.copied > 1 ? "s" : ""} from Joplin. ` : "") +
+            (moved.missing.length ? `${moved.missing.length} attachment${moved.missing.length > 1 ? "s weren't" : " wasn't"} on the Joplin Server (${moved.missing.slice(0, 3).join(", ")}). ` : "") +
+            "The next Joplin sync moves the old copy to Joplin's trash.",
+        });
+        onClose();
+        return;
+      }
+      if (bm && (bm.preview || bm.archive) && webOn) afterBookmarkSave(savedId, bm);
       if (extras.length) {
         const r = await uploadEach(extras, { text: "", tags: data.tags, color: data.color, pinned: false });
         if (r.failed.length) {
@@ -360,6 +493,27 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
       onClose();
     } catch (e) {
       toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const stranded = useMemo(() => strandedRefs(v, existing ? v.notes.find((n) => n.id === existing.id) || existing : undefined), [v.notes, v.spaces, existing]); // eslint-disable-line
+
+  async function repairStranded() {
+    const cur = existing && (v.notes.find((n) => n.id === existing.id) || existing);
+    if (!cur) return;
+    setBusy(true);
+    try {
+      const r = await moveFromJoplin(v, cur, { spaceId: cur.spaceId, boardId: cur.boardId }, { ...cur.data, modified: Date.now() }, null, true);
+      toast({
+        title: r.copied ? `Copied ${r.copied} attachment${r.copied > 1 ? "s" : ""} into Scute` : "Nothing copied",
+        description: r.missing.length ? `Not found on your Joplin Server${r.missing.length > 1 ? "s" : ""}: ${r.missing.slice(0, 3).join(", ")}` : undefined,
+        variant: r.copied ? undefined : "destructive",
+      });
+      if (r.copied) onClose();
+    } catch (e) {
+      toast({ title: "Couldn't copy the attachments", description: (e as Error).message, variant: "destructive" });
     } finally {
       setBusy(false);
     }
@@ -441,7 +595,8 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
               {d.type === "image" && <DecryptedImage note={existing} alt={d.title || "Image"} className="w-full rounded-md border bg-muted" />}
               {(d.type === "video" || (d.type === "file" && isVideoMime(d.file?.type))) && <VideoPlayer note={existing} onDownload={download} onSetThumb={writable ? setThumbFromFrame : undefined} />}
               {d.type === "file" && isAudioMime(d.file?.type) && <AudioPlayer note={existing} onDownload={download} />}
-              {(d.type === "link" || d.type === "text") && embed && <EmbedPlayer key={d.url} embed={embed} />}
+              {d.type === "text" && embed && <EmbedPlayer key={d.url} embed={embed} />}
+              {d.type === "link" && <BookmarkView noteId={existing.id} writable={writable} />}
               {d.type === "link" && d.url && (
                 <a href={d.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 text-sm text-primary hover:underline break-all" data-testid="link-open-url">
                   <ExternalLink className="h-3.5 w-3.5 shrink-0" />
@@ -492,7 +647,18 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
                   </Button>
                 </div>
               )}
-              {d.text ? <Markdown src={d.text} /> : null}
+              {d.text ? <Markdown src={d.text} noteId={existing.id} /> : null}
+              {writable && stranded.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs" role="status" data-testid="banner-joplin-stranded">
+                  <span className="flex-1 min-w-48">
+                    {stranded.length === 1 ? "An attachment in this note is" : `${stranded.length} attachments in this note are`} still on a Joplin Server. Copy {stranded.length === 1 ? "it" : "them"} into Scute so {stranded.length === 1 ? "it stays" : "they stay"} with the note.
+                  </span>
+                  <Button size="sm" variant="outline" onClick={repairStranded} disabled={busy} data-testid="button-copy-joplin-attachments">
+                    {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Download className="h-3.5 w-3.5" />}
+                    Copy into Scute
+                  </Button>
+                </div>
+              )}
               {d.tags.length > 0 && (
                 <div className="flex flex-wrap gap-1.5">
                   {d.tags.map((t) => (
@@ -527,6 +693,7 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
                       {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
                       {busy && batchStep ? `Uploading ${batchStep.i + 1} of ${batchStep.n}…` : "Attach files"}
                     </Button>
+                    <PluginNoteActions note={existing} />
                     <div className="flex-1" />
                     <Button variant="ghost" className="text-destructive hover:text-destructive" onClick={() => setConfirmDel(true)} data-testid="button-delete-note">
                       <Trash2 className="h-4 w-4" />
@@ -534,7 +701,12 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
                     </Button>
                   </>
                 )}
-                {!writable && <p className="text-xs text-muted-foreground">You have read-only access to this space.</p>}
+                {!writable && (
+                  <>
+                    <PluginNoteActions note={existing} />
+                    <p className="text-xs text-muted-foreground">You have read-only access to this space.</p>
+                  </>
+                )}
               </div>
             </div>
           ) : (
@@ -568,12 +740,66 @@ export function NoteEditor({ target, onClose, onSlideshow }: { target: EditorTar
                 <div className="space-y-1.5">
                   <Label htmlFor="n-url">{d.type === "link" ? "URL" : "Website"}</Label>
                   <Input id="n-url" type="text" inputMode="url" placeholder="https://" value={d.url || ""} onChange={(e) => set("url", e.target.value)} autoFocus={d.type === "link"} data-testid="input-note-url" />
+                  {d.type === "link" && (
+                    <>
+                      <DuplicateWarning
+                        url={normUrl(d.url)}
+                        exceptId={existing?.id}
+                        onOpen={
+                          onOpenNote
+                            ? (n) => {
+                                onClose();
+                                setTimeout(() => onOpenNote(n), 0);
+                              }
+                            : undefined
+                        }
+                      />
+                      {(lpBusy || (lp && lp.forUrl === normUrl(d.url))) && (
+                        <div className="flex items-center gap-2.5 rounded-md border px-2 py-1.5 text-xs" data-testid="panel-link-preview">
+                          {lpBusy ? (
+                            <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" /> Looking up the link…
+                            </span>
+                          ) : (
+                            lp && (
+                              <>
+                                {lp.thumb ? <img src={lp.thumb} alt="" className="h-10 w-14 shrink-0 rounded object-cover bg-muted" /> : null}
+                                <span className="min-w-0 flex-1">
+                                  <span className="block truncate font-medium">{lp.title || lp.url}</span>
+                                  <span className="block truncate text-muted-foreground" data-testid="text-link-kind">
+                                    {{ page: "Web page", image: "Image", video: "Video", audio: "Audio", file: "File" }[lp.kind]}
+                                    {lp.site ? ` · ${lp.site}` : ""}
+                                  </span>
+                                </span>
+                              </>
+                            )
+                          )}
+                        </div>
+                      )}
+                      {webOn && canArchive(normUrl(d.url) || "https://x.invalid/") && (
+                        <label className="flex flex-wrap items-center gap-x-2 gap-y-0.5 pt-1 text-sm">
+                          <input
+                            type="checkbox"
+                            checked={saveCopy}
+                            onChange={(e) => {
+                              setSaveCopy(e.target.checked);
+                              localStorage.setItem(ARCHIVE_PREF, e.target.checked ? "on" : "off");
+                            }}
+                            className="h-4 w-4 accent-[hsl(var(--primary))]"
+                            data-testid="checkbox-save-copy"
+                          />
+                          {existing?.data.archive ? "Save a fresh copy if the URL changes" : `Save a copy of the ${{ page: "page", image: "image", video: "video", audio: "audio", file: "file" }[(lp && lp.forUrl === normUrl(d.url) && lp.kind) || existing?.data.preview?.kind || "page"]}`}
+                          <span className="text-xs text-muted-foreground">(encrypted, kept even if the site disappears)</span>
+                        </label>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
 
               {batch.length < 2 && <div className="space-y-1.5">
                 <Label htmlFor="n-title">Title</Label>
-                <Input id="n-title" value={d.title} onChange={(e) => set("title", e.target.value)} autoFocus={d.type === "text"} data-testid="input-note-title" />
+                <Input id="n-title" value={d.title} onChange={(e) => ((titleTouched.current = true), set("title", e.target.value))} autoFocus={d.type === "text"} data-testid="input-note-title" />
               </div>}
 
               {d.type === "password" && (

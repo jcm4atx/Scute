@@ -16,11 +16,23 @@ import {
   type UserRow,
   type MemberRow,
 } from "./storage";
+import { NET_ON, PLUGINS_ON, registerPluginRoutes } from "./plugins";
+import { WEB_ON, registerWebRoutes } from "./web";
+import { SHARES_ON, registerShareRoutes, removeUserShares } from "./shares";
+import { registerDriveRoutes, removeUserDrive } from "./drive";
 
 const VERSION = APP_VERSION;
 const REGISTRATION = (process.env.SCUTE_REGISTRATION || "open").toLowerCase(); // open | closed
 const MAX_UPLOAD_MB = Number(process.env.SCUTE_MAX_UPLOAD_MB || 200);
 const SESSION_DAYS = Number(process.env.SCUTE_SESSION_DAYS || 90);
+// Joplin Server bridge: on unless SCUTE_JOPLIN=off. SCUTE_JOPLIN_URLS optionally
+// restricts which Joplin Server base URLs may be reached (comma separated prefixes).
+const JOPLIN = !["off", "0", "false", "no"].includes((process.env.SCUTE_JOPLIN || "on").toLowerCase());
+const JOPLIN_URLS = (process.env.SCUTE_JOPLIN_URLS || "")
+  .split(/[\s,]+/)
+  .map((x) => x.trim().replace(/\/+$/, ""))
+  .filter(Boolean);
+const CLIENT_EXTRAS = JOPLIN ? ["joplin"] : [];
 
 // ---------- helpers ----------
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -91,6 +103,13 @@ class HttpError extends Error {
 }
 
 type AuthedReq = Request & { user: UserRow; tokenHash: string };
+
+/** The user a session token belongs to, or null (for WebDAV from the web app). */
+function sessionUser(token: string): UserRow | null {
+  const s = db.prepare("SELECT * FROM sessions WHERE token_hash = ?").get(sha256(token)) as { user_id: string; last_seen: number } | undefined;
+  if (!s || Date.now() - s.last_seen > SESSION_DAYS * 86400_000) return null;
+  return (db.prepare("SELECT * FROM users WHERE id = ?").get(s.user_id) as UserRow | undefined) || null;
+}
 
 function auth(req: Request, _res: Response, next: NextFunction) {
   const h = req.headers.authorization || "";
@@ -168,7 +187,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       version: VERSION,
       registration: users === 0 ? "open" : REGISTRATION,
       maxUploadMb: MAX_UPLOAD_MB,
-      features: ["video", "multi-upload", "slideshow", "video-thumbnails"],
+      features: ["video", "multi-upload", "slideshow", "video-thumbnails", "default-space", ...(JOPLIN ? ["joplin"] : []), ...(PLUGINS_ON ? ["plugins"] : []), ...(NET_ON ? ["plugin-net"] : []), ...(WEB_ON ? ["web-archive", "bookmark-previews"] : []), ...(SHARES_ON ? ["shares"] : [])],
       hasUsers: users > 0,
     });
   });
@@ -350,6 +369,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const u = req.user;
       if (!safeEq(hashAuth(body.authKey, u.auth_salt), u.auth_hash)) throw new HttpError(401, "Password is wrong");
       const owned = db.prepare("SELECT id FROM spaces WHERE owner_id = ?").all(u.id) as { id: string }[];
+      removeUserShares(u.id);
+      removeUserDrive(u);
       const tx = db.transaction(() => {
         for (const s of owned) {
           const notes = db.prepare("SELECT id FROM notes WHERE space_id = ? AND file_size IS NOT NULL").all(s.id) as {
@@ -433,6 +454,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       res.json({
         seq,
         full: since === 0,
+        extras: CLIENT_EXTRAS,
         settings: req.user.enc_settings,
         spaces: spaces.map(({ mseq, ...s }) => s),
         members,
@@ -674,12 +696,79 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }),
   );
 
+
+  // ---------- tombstones (ids only) so bridges can tell local deletions apart ----------
+  app.get(
+    "/api/spaces/:id/tombstones",
+    auth,
+    wrap((req, res) => {
+      const id = parse(uuid, req.params.id);
+      requireRole(id, req.user.id, "guest");
+      const notes = (db.prepare("SELECT id FROM notes WHERE space_id = ? AND deleted = 1").all(id) as { id: string }[]).map((r) => r.id);
+      const boards = (db.prepare("SELECT id FROM boards WHERE space_id = ? AND deleted = 1").all(id) as { id: string }[]).map((r) => r.id);
+      res.json({ notes, boards });
+    }),
+  );
+
+  // ---------- Joplin Server bridge ----------
+  // Browsers can't call a Joplin Server directly (no CORS), so Scute relays the
+  // Joplin sync API. Only Joplin API paths are relayed and nothing is stored.
+  const JOPLIN_PATH = /^api\/(sessions|ping|batch_items|locks(\/[A-Za-z0-9_-]+)?|items\/root(:\/[^?#]*:)?(\/(content|delta|children))?)$/;
+  app.all(
+    /^\/api\/joplin\/.+/,
+    auth,
+    express.raw({ type: (r) => !String(r.headers["content-type"] || "").includes("application/json"), limit: `${MAX_UPLOAD_MB}mb` }),
+    wrap(async (req, res) => {
+      if (!JOPLIN) throw new HttpError(404, "The Joplin bridge is turned off on this server");
+      const base = String(req.header("x-joplin-url") || "").trim().replace(/\/+$/, "");
+      let u: URL;
+      try {
+        u = new URL(base);
+      } catch {
+        throw new HttpError(400, "Invalid Joplin Server URL");
+      }
+      if (!/^https?:$/.test(u.protocol)) throw new HttpError(400, "Joplin Server URL must start with http:// or https://");
+      if (JOPLIN_URLS.length && !JOPLIN_URLS.some((p) => base === p || base.startsWith(p + "/")))
+        throw new HttpError(403, "That Joplin Server isn't on this server's allow list (SCUTE_JOPLIN_URLS)");
+      const path = req.originalUrl.replace(/^\/api\/joplin\//, "").split("?")[0];
+      if (!JOPLIN_PATH.test(path)) throw new HttpError(400, "Not a Joplin sync API path");
+      const qs = req.originalUrl.includes("?") ? req.originalUrl.slice(req.originalUrl.indexOf("?")) : "";
+      const headers: Record<string, string> = { "X-API-MIN-VERSION": "2.6.0" };
+      const auth2 = req.header("x-api-auth");
+      if (auth2) headers["X-API-AUTH"] = auth2;
+      let body: Buffer | undefined;
+      if (!["GET", "HEAD"].includes(req.method)) {
+        const ct = String(req.headers["content-type"] || "application/octet-stream");
+        headers["Content-Type"] = ct.includes("application/json") ? "application/json" : "application/octet-stream";
+        body = Buffer.isBuffer(req.body) ? req.body : Buffer.isBuffer((req as any).rawBody) ? (req as any).rawBody : Buffer.from(JSON.stringify(req.body ?? {}));
+      }
+      let r: globalThis.Response;
+      try {
+        r = await fetch(base + "/" + path + qs, { method: req.method, headers, body, signal: AbortSignal.timeout(120_000), redirect: "follow" });
+      } catch (e) {
+        throw new HttpError(502, `Couldn't reach the Joplin Server: ${(e as Error).message}`);
+      }
+      const buf = Buffer.from(await r.arrayBuffer());
+      res.status(r.status);
+      res.setHeader("Content-Type", r.headers.get("content-type") || "application/octet-stream");
+      res.setHeader("X-Joplin-Status", String(r.status));
+      res.setHeader("Cache-Control", "no-store");
+      res.end(buf);
+    }),
+  );
+
+  // ---------- plug-ins ----------
+  registerPluginRoutes(app, { auth, wrap, HttpError });
+  registerWebRoutes(app, { auth, wrap, HttpError } as any);
+  registerShareRoutes(app, { auth, wrap, HttpError } as any);
+  registerDriveRoutes(app, { auth, wrap, HttpError, sessionUser } as any);
+
   // JSON errors for the API
   app.use("/api", (err: any, _req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) return next(err);
     const status = err instanceof HttpError ? err.status : err.status || err.statusCode || 500;
-    if (status >= 500) console.error(err);
-    res.status(status).json({ message: status >= 500 ? "Server error" : err.message });
+    if (status >= 500 && !(err instanceof HttpError)) console.error(err);
+    res.status(status).json({ message: status >= 500 && !(err instanceof HttpError) ? "Server error" : err.message });
   });
   app.use("/api", (_req, res) => res.status(404).json({ message: "Not found" }));
 

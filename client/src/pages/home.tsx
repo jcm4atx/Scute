@@ -22,6 +22,9 @@ import { LogoMark } from "@/components/logo";
 import { NoteCard, NOTE_TYPES } from "@/components/note-parts";
 import { NoteEditor, type EditorTarget } from "@/components/note-editor";
 import { SettingsDialog, SpaceDialog } from "@/components/dialogs";
+import { JoplinBar, JoplinDialog, useJoplinResolver } from "@/components/joplin";
+import { fetchResource } from "@/lib/joplin";
+import { ResourceContext, type ResourceResolver } from "@/components/note-parts";
 import {
   ArrowDownUp,
   Check,
@@ -48,9 +51,20 @@ import {
   Globe2,
   Upload,
   GalleryHorizontalEnd,
+  NotebookPen,
+  Star,
 } from "lucide-react";
 import { Slideshow } from "@/components/slideshow";
+import { BookmarkRuntime, BookmarkToolsDialog } from "@/components/bookmarks";
+import { Bookmark } from "lucide-react";
 import { isImageNote } from "@/lib/media";
+import { emitPluginEvent, noteTypeOf, PluginIcon, PluginViewHost, runGuarded, setPluginBridge, toPlain, usePluginLoader, usePlugins, type Ctx, type MenuItem } from "@/lib/plugins";
+import { PluginCommandsMenu, PluginDialogHost } from "@/components/plugin-ui";
+import { Puzzle } from "lucide-react";
+import { Eye, EyeOff } from "lucide-react";
+import { RevealDialog } from "@/components/hidden-spaces";
+import { DeleteNotesDialog, MoveDialog, NOTE_DRAG, SelectionBar, moveNotes, moveSummary } from "@/components/bulk";
+import { CheckSquare } from "lucide-react";
 
 type Sort = "modified" | "created" | "title";
 
@@ -91,8 +105,17 @@ export default function Home() {
   const [tagFilter, setTagFilter] = useState<string | null>(null);
   const [sort, setSort] = useState<Sort>("modified");
   const [editor, setEditor] = useState<EditorTarget | null>(null);
+  const [ptab, setPtab] = useState<{ spaceId: string; tab: string } | null>(null); // plug-in space kind tab
   const [spaceDlg, setSpaceDlg] = useState<{ open: boolean; create: boolean }>({ open: false, create: false });
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [revealOpen, setRevealOpen] = useState(false);
+  /** Selected note ids; null when not selecting. */
+  const [sel, setSel] = useState<Set<string> | null>(null);
+  const selAnchor = useRef<string | null>(null);
+  const [moving, setMoving] = useState<Note[] | null>(null);
+  const [deleting, setDeleting] = useState<Note[] | null>(null);
+  const [dropBoard, setDropBoard] = useState<string | null>(null); // board (or "__all") a drag is over
+  const joplinPrompted = useRef<string | null>(null);
   const [navOpen, setNavOpen] = useState(false);
   const [newBoard, setNewBoard] = useState<string | null>(null);
   const [renaming, setRenaming] = useState<{ id: string; title: string } | null>(null);
@@ -107,9 +130,129 @@ export default function Home() {
     return () => clearInterval(t);
   }, [v.user?.id]);
 
-  const space = v.spaces.find((s) => s.id === route.spaceId) || v.spaces.find((s) => s.id === lastSpace) || v.spaces[0] || null;
+  const space =
+    v.spaces.find((s) => s.id === route.spaceId) ||
+    v.spaces.find((s) => s.id === v.settings.defaultSpaceId) ||
+    v.spaces.find((s) => s.id === lastSpace) ||
+    v.spaces[0] ||
+    null;
+  // hidden spaces: step out of one that was just hidden, and Ctrl+Alt+H to show or hide them
+  const hiddenIds = v.settings.hiddenSpaces || [];
+  const hiddenAway = hiddenIds.some((id) => !v.spaces.some((s) => s.id === id));
+  useEffect(() => {
+    if (route.spaceId && !v.spaces.some((s) => s.id === route.spaceId) && v.allSpaces.some((s) => s.id === route.spaceId)) navigate("/", { replace: true });
+  }, [route.spaceId, v.spaces]); // eslint-disable-line
+  useEffect(() => {
+    if (editor?.note && hiddenIds.includes(editor.note.spaceId) && !v.spaces.some((s) => s.id === editor.note!.spaceId)) setEditor(null);
+  }, [v.spaces]); // eslint-disable-line
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey && e.altKey && !e.shiftKey && !e.metaKey && e.code === "KeyH")) return;
+      e.preventDefault();
+      if (v.revealed) v.conceal();
+      else if (hiddenAway) setRevealOpen(true);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [v.revealed, v.conceal, hiddenAway]);
   const board = route.boardId ? v.boards.find((b) => b.id === route.boardId) || null : null;
   const writable = canWrite(space?.role);
+  const kind = space?.data.kind || "notes";
+  // ---------- plug-ins ----------
+  usePluginLoader();
+  const plugins = usePlugins();
+  const pk = kind !== "notes" ? plugins.reg.spaceKinds.find((k) => k.id === kind) || null : null; // plug-in space kind
+  const full = pk?.layout === "full";
+  const tabId = pk?.tabs?.length ? (ptab && ptab.spaceId === space?.id && pk.tabs.some((t) => t.id === ptab.tab) ? ptab.tab : pk.tabs[0].id) : null;
+  const curTab = pk?.tabs?.find((t) => t.id === tabId) || null;
+  const tabView = useMemo(() => (pk && curTab?.mount ? { id: curTab.id, title: curTab.title, mount: curTab.mount, pluginId: pk.pluginId, uid: `${pk.uid}:${curTab.id}` } : null), [pk, curTab]);
+  const fullView = useMemo(() => (pk && full && pk.mount ? { id: pk.id, title: pk.title, mount: pk.mount, pluginId: pk.pluginId, uid: pk.uid } : null), [pk, full]);
+  const joplin = kind === "joplin" && v.extras.includes("joplin");
+  const [joplinDlg, setJoplinDlg] = useState(false);
+  const [bmTools, setBmTools] = useState(false);
+  const joplinResolver = useJoplinResolver(space, joplin);
+  // ":/<id>" links can also point at another Scute note's attachment (a note with several
+  // photos moved out of a Joplin space keeps them as notes of their own).
+  const notesRef = useRef(v.notes);
+  notesRef.current = v.notes;
+  const resolver = useMemo<ResourceResolver>(
+    () => async (rid: string) => {
+      const h = rid.toLowerCase();
+      const n = notesRef.current.find((x) => x.fileSize && x.data.file && x.id.replace(/-/g, "") === h);
+      if (n) return { url: await v.getFileUrl(n), mime: n.data.file!.type || "application/octet-stream", name: n.data.file!.name };
+      if (joplinResolver) return joplinResolver(rid);
+      // a note moved out of a Joplin space before its attachments were copied: try the Joplin spaces
+      const cfgs = v.extras.includes("joplin") ? v.spaces.filter((s) => s.data.kind === "joplin" && s.data.joplin?.url && s.data.joplin.email && s.data.joplin.password).map((s) => s.data.joplin!) : [];
+      for (const c of cfgs) {
+        try {
+          return await fetchResource(c, rid);
+        } catch {
+          /* try the next one */
+        }
+      }
+      throw new Error(cfgs.length ? "it isn't on your Joplin Servers" : "the attachment isn't in this space");
+    },
+    [joplinResolver, v.spaces, v.extras], // eslint-disable-line
+  );
+  const openNote = (n: Note) => {
+    const pt = noteTypeOf(n.data.type);
+    if (pt?.open) pt.open(toPlain(n, pt.pluginId), { ...pctx.current, spaceId: n.spaceId });
+    else setEditor({ note: n, spaceId: n.spaceId, boardId: n.boardId });
+  };
+  const [pview, setPview] = useState<{ pluginId: string; viewId: string } | null>(null);
+  const activeView = pview ? plugins.reg.views.find((x) => x.pluginId === pview.pluginId && x.id === pview.viewId) || null : null;
+  const pctx = useRef<Ctx>({ spaceId: null, boardId: null, noteId: null });
+  pctx.current = { spaceId: space?.id || null, boardId: board?.id || null, noteId: editor?.note?.id || null };
+  const vNotes = useRef(v.notes);
+  vNotes.current = v.notes;
+  setPluginBridge({
+    ctx: () => ({ ...pctx.current }),
+    openNote: (id) => {
+      const n = vNotes.current.find((x) => x.id === id);
+      if (!n) return toast({ title: "That note isn't here yet", description: "It may still be syncing.", variant: "destructive" });
+      if (n.spaceId !== pctx.current.spaceId) navigate(`/s/${n.spaceId}`);
+      openNote(n);
+    },
+    openView: (pluginId, viewId) => {
+      setPview({ pluginId, viewId });
+      setNavOpen(false);
+    },
+    openSpace: (spaceId, tab) => {
+      // No membership check here: a space a plug-in just created may not be in
+      // this render's list yet. Unknown ids fall back like any other bad URL.
+      if (typeof spaceId !== "string" || !/^[0-9a-f-]{36}$/i.test(spaceId)) return;
+      go(spaceId);
+      if (tab) setPtab({ spaceId, tab });
+    },
+  });
+  useEffect(() => {
+    if (editor?.note) emitPluginEvent("note:open", toPlain(editor.note));
+  }, [editor?.note?.id]); // eslint-disable-line
+  useEffect(() => {
+    if (space) emitPluginEvent("space:change", { id: space.id, title: space.data.title });
+  }, [space?.id, plugins.rev > 0]); // eslint-disable-line
+  const useTemplate = async (t: (typeof plugins.reg.templates)[number]) => {
+    if (!space) return;
+    const ctx = { ...pctx.current };
+    const out = await Promise.resolve(runGuarded(t.pluginId, `template "${t.title}"`, () => t.create(ctx)) as any).catch(() => null);
+    if (!out) return;
+    const prefill: Record<string, unknown> = {};
+    for (const k of ["title", "text", "url", "tags", "color", "pinned"]) if (out[k] !== undefined) prefill[k] = out[k];
+    if (out.data !== undefined) prefill.ext = { [t.pluginId]: out.data };
+    setEditor({ type: out.type === "link" ? "link" : "text", spaceId: space.id, boardId: out.boardId !== undefined ? out.boardId : board?.id || null, prefill: prefill as any });
+  };
+  const templateItems = (suffix: string) =>
+    plugins.reg.templates.length > 0 && (
+      <>
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel className="text-xs text-muted-foreground">Templates</DropdownMenuLabel>
+        {plugins.reg.templates.map((t) => (
+          <DropdownMenuItem key={t.uid} onClick={() => void useTemplate(t)} data-testid={`menu-template-${t.pluginId}-${t.id}${suffix}`}>
+            <Puzzle className="h-4 w-4" /> {t.title}
+          </DropdownMenuItem>
+        ))}
+      </>
+    );
 
   useEffect(() => {
     if (space && v.user) void idbSet(`u:${v.user.id}:lastSpace`, space.id);
@@ -159,16 +302,46 @@ export default function Home() {
       if (e.key === "/") {
         e.preventDefault();
         searchRef.current?.focus();
-      } else if ((e.key === "n" || e.key === "N") && space && writable) {
+      } else if ((e.key === "n" || e.key === "N") && space && writable && !full) {
         e.preventDefault();
         setEditor({ type: "text", spaceId: space.id, boardId: board?.id || null });
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [space?.id, board?.id, writable]); // eslint-disable-line
+  }, [space?.id, board?.id, writable, full]); // eslint-disable-line
 
-  const spaceBoards = useMemo(() => v.boards.filter((b) => b.spaceId === space?.id), [v.boards, space?.id]);
+  // boards in tree order (Joplin notebooks can be nested); depth is used for indentation
+  const spaceBoards = useMemo(() => {
+    const list = v.boards.filter((b) => b.spaceId === space?.id);
+    if (!list.some((b) => b.data.parentId)) return list.map((b) => ({ ...b, depth: 0 }));
+    const ids = new Set(list.map((b) => b.id));
+    const kids = new Map<string, typeof list>();
+    for (const b of list) {
+      const p = b.data.parentId && ids.has(b.data.parentId) && b.data.parentId !== b.id ? b.data.parentId : "";
+      kids.set(p, [...(kids.get(p) || []), b]);
+    }
+    const out: ((typeof list)[number] & { depth: number })[] = [];
+    const seen = new Set<string>();
+    const walk = (p: string, depth: number) => {
+      for (const b of (kids.get(p) || []).sort((a, c) => a.data.title.localeCompare(c.data.title))) {
+        if (seen.has(b.id)) continue;
+        seen.add(b.id);
+        out.push({ ...b, depth });
+        walk(b.id, depth + 1);
+      }
+    };
+    walk("", 0);
+    for (const b of list) if (!seen.has(b.id)) out.push({ ...b, depth: 0 }); // cycles
+    return out;
+  }, [v.boards, space?.id]);
+
+  // open the connection dialog the first time an unconfigured Joplin space is shown
+  useEffect(() => {
+    if (!joplin || !space || space.data.joplin || !canManage(space.role) || joplinPrompted.current === space.id) return;
+    joplinPrompted.current = space.id;
+    setJoplinDlg(true);
+  }, [joplin, space?.id, space?.data.joplin]); // eslint-disable-line
   const boardName = useMemo(() => new Map(v.boards.map((b) => [b.id, b.data.title])), [v.boards]);
   const spaceNotes = useMemo(() => v.notes.filter((n) => n.spaceId === space?.id), [v.notes, space?.id]);
 
@@ -202,12 +375,91 @@ export default function Home() {
     });
     return sorted;
   }, [v.notes, spaceNotes, board, typeFilter, tagFilter, q, allSpaces, sort]);
+
+  // ---------- selecting notes ----------
+  useEffect(() => setSel(null), [space?.id]);
+  const selected = useMemo(() => (sel ? visible.filter((n) => sel.has(n.id)) : []), [sel, visible]);
+  const selWritable = selected.length > 0 && selected.every((n) => canWrite(v.spaces.find((s) => s.id === n.spaceId)?.role));
+  const toggleSel = (n: Note, shift: boolean) => {
+    const anchor = selAnchor.current; // read now: the update below runs later
+    selAnchor.current = n.id;
+    setSel((cur) => {
+      const next = new Set(cur || []);
+      if (shift && anchor && cur) {
+        const a = visible.findIndex((x) => x.id === anchor);
+        const b = visible.findIndex((x) => x.id === n.id);
+        if (a >= 0 && b >= 0) {
+          const on = !next.has(n.id) || next.has(anchor);
+          for (let k = Math.min(a, b); k <= Math.max(a, b); k++) on ? next.add(visible[k].id) : next.delete(visible[k].id);
+          return next;
+        }
+      }
+      next.has(n.id) ? next.delete(n.id) : next.add(n.id);
+      return next;
+    });
+  };
+  useEffect(() => {
+    if (!sel) return;
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.target as HTMLElement).closest("input, textarea, [contenteditable], [role=dialog], [role=alertdialog]")) return;
+      if (e.key === "Escape") setSel(null);
+      else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        setSel(new Set(visible.map((n) => n.id)));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sel, visible]);
+  /** Dragging a card (all selected cards, if it's one of them) onto a board in the sidebar moves them. */
+  const dragNotes = (n: Note) => (e: React.DragEvent) => {
+    const ids = sel?.has(n.id) ? selected.map((x) => x.id) : [n.id];
+    e.dataTransfer.setData(NOTE_DRAG, JSON.stringify(ids));
+    e.dataTransfer.effectAllowed = "move";
+    if (ids.length > 1) {
+      const g = document.createElement("div");
+      g.textContent = `${ids.length} notes`;
+      g.style.cssText = "position:fixed;top:-100px;left:0;padding:6px 10px;border-radius:8px;font:600 13px system-ui;background:#2f6f5e;color:#fff";
+      document.body.appendChild(g);
+      e.dataTransfer.setDragImage(g, 10, 10);
+      setTimeout(() => g.remove(), 0);
+    }
+  };
+  const dropTarget = (key: string, boardId: string | null, title: string) =>
+    writable
+      ? {
+          onDragOver: (e: React.DragEvent) => {
+            if (!e.dataTransfer.types.includes(NOTE_DRAG)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = "move";
+            if (dropBoard !== key) setDropBoard(key);
+          },
+          onDragLeave: () => setDropBoard((d) => (d === key ? null : d)),
+          onDrop: async (e: React.DragEvent) => {
+            const raw = e.dataTransfer.getData(NOTE_DRAG);
+            setDropBoard(null);
+            if (!raw || !space) return;
+            e.preventDefault();
+            const ids = new Set<string>(JSON.parse(raw));
+            const notes = v.notes.filter((n) => ids.has(n.id));
+            try {
+              const r = await moveNotes(v, notes, { spaceId: space.id, boardId });
+              const m = moveSummary(r, title);
+              toast({ title: m.title, description: m.description, variant: m.error ? "destructive" : undefined });
+              if (r.moved) setSel(null);
+            } catch (err) {
+              toast({ title: "Couldn't move", description: (err as Error).message, variant: "destructive" });
+            }
+          },
+        }
+      : {};
   // Slideshow = every still image in the current view, in view order. Videos are never included.
   const images = useMemo(() => visible.filter((n) => isImageNote(n.data) && (n.fileSize || n.data.thumb)), [visible]);
 
   const go = (spaceId: string, boardId?: string | null) => {
     navigate(boardId ? `/s/${spaceId}/b/${boardId}` : `/s/${spaceId}`);
     setTagFilter(null);
+    setPview(null);
     setNavOpen(false);
   };
 
@@ -220,6 +472,18 @@ export default function Home() {
   }
 
   const newNote = (type: NoteType) => space && setEditor({ type, spaceId: space.id, boardId: board?.id || null });
+  const runItem = (m: MenuItem) => m.run({ ...pctx.current });
+  const kindNewItems = (suffix = "") =>
+    pk?.newItems?.length ? (
+      <>
+        {pk.newItems.map((m) => (
+          <DropdownMenuItem key={m.id} onClick={() => runItem(m)} data-testid={`menu-${m.id}${suffix}`}>
+            <PluginIcon icon={m.icon} /> {m.title}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuSeparator />
+      </>
+    ) : null;
   const uploadRef = useRef<HTMLInputElement>(null);
   const [dropping, setDropping] = useState(false);
   const openUpload = (files: File[]) => {
@@ -250,6 +514,8 @@ export default function Home() {
               <DropdownMenuItem key={s.id} onClick={() => go(s.id)} data-testid={`menu-space-${s.id}`}>
                 <span className="h-2.5 w-2.5 rounded-full" style={{ background: s.data.color }} />
                 <span className="flex-1 truncate">{s.data.title}</span>
+                {hiddenIds.includes(s.id) && <EyeOff className="h-3 w-3 text-muted-foreground" aria-label="Hidden space" />}
+                {s.id === v.settings.defaultSpaceId && <Star className="h-3 w-3 fill-current text-muted-foreground" aria-label="Default space" />}
                 {s.role !== "owner" && <span className="text-[10px] uppercase text-muted-foreground">{s.role}</span>}
                 {s.id === space?.id && <Check className="h-3.5 w-3.5" />}
               </DropdownMenuItem>
@@ -258,6 +524,67 @@ export default function Home() {
             <DropdownMenuItem onClick={() => setSpaceDlg({ open: true, create: true })} data-testid="menu-new-space">
               <Plus className="h-4 w-4" /> New space
             </DropdownMenuItem>
+            {v.revealed && hiddenIds.length > 0 ? (
+              <DropdownMenuItem onClick={v.conceal} data-testid="menu-conceal-spaces">
+                <EyeOff className="h-4 w-4" /> Hide hidden spaces
+              </DropdownMenuItem>
+            ) : (
+              hiddenAway &&
+              !v.settings.hiddenQuiet && (
+                <DropdownMenuItem onClick={() => setRevealOpen(true)} data-testid="menu-reveal-spaces">
+                  <Eye className="h-4 w-4" /> Show hidden spaces…
+                </DropdownMenuItem>
+              )
+            )}
+            {space && !hiddenIds.includes(space.id) && (
+              <DropdownMenuItem
+                onClick={() =>
+                  v
+                    .setSpaceHidden(space.id, true)
+                    .then(() => toast({ title: "Space hidden", description: "Show hidden spaces from the space menu or Settings, or with Ctrl+Alt+H." }))
+                    .catch((e) => toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" }))
+                }
+                data-testid="menu-hide-space"
+              >
+                <EyeOff className="h-4 w-4" /> Hide this space
+              </DropdownMenuItem>
+            )}
+            {space && v.settings.defaultSpaceId !== space.id && (
+              <DropdownMenuItem
+                onClick={() =>
+                  v
+                    .saveSettings({ defaultSpaceId: space.id })
+                    .then(() => toast({ title: "Default space set", description: `Scute will open ${space.data.title} when it starts.` }))
+                    .catch((e) => toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" }))
+                }
+                data-testid="menu-make-default"
+              >
+                <Star className="h-4 w-4" /> Make default space
+              </DropdownMenuItem>
+            )}
+            {plugins.reg.menus
+              .filter((m) => m.location === "spaces" && (!m.when || m.when({ ...pctx.current })))
+              .map((m) => (
+                <DropdownMenuItem key={m.uid} onClick={() => runItem(m)} data-testid={`menu-${m.id}`}>
+                  <PluginIcon icon={m.icon} /> {m.title}
+                </DropdownMenuItem>
+              ))}
+            {space &&
+              pk?.menuItems?.map((m) => (
+                <DropdownMenuItem key={m.id} onClick={() => runItem(m)} data-testid={`menu-${m.id}`}>
+                  <PluginIcon icon={m.icon} /> {m.title}
+                </DropdownMenuItem>
+              ))}
+            {space && !full && (
+              <DropdownMenuItem onClick={() => setBmTools(true)} data-testid="menu-bookmark-tools">
+                <Bookmark className="h-4 w-4" /> Bookmark tools…
+              </DropdownMenuItem>
+            )}
+            {joplin && space && (
+              <DropdownMenuItem onClick={() => setJoplinDlg(true)} data-testid="menu-joplin-connection">
+                <NotebookPen className="h-4 w-4" /> Joplin connection…
+              </DropdownMenuItem>
+            )}
             {space && (
               <DropdownMenuItem onClick={() => setSpaceDlg({ open: true, create: false })} data-testid="menu-space-settings">
                 <Settings className="h-4 w-4" /> {canManage(space.role) ? "Space settings & sharing" : "Space members"}
@@ -267,9 +594,10 @@ export default function Home() {
         </DropdownMenu>
       </div>
 
+      {full ? <div className="flex-1" /> : (
       <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-5" aria-label="Boards and tags">
         <div className="space-y-0.5">
-          <button onClick={() => space && go(space.id)} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm ${!board ? "bg-sidebar-accent font-medium" : "hover:bg-sidebar-accent/60"}`} data-testid="link-all-notes">
+          <button onClick={() => space && go(space.id)} {...dropTarget("__all", null, "no board")} className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm ${dropBoard === "__all" ? "ring-2 ring-primary bg-primary/10" : !board && !activeView ? "bg-sidebar-accent font-medium" : "hover:bg-sidebar-accent/60"}`} data-testid="link-all-notes">
             <LayoutGrid className="h-4 w-4 text-muted-foreground" />
             <span className="flex-1 text-left">All notes</span>
             <span className="text-xs text-muted-foreground tabular-nums">{spaceNotes.length}</span>
@@ -302,8 +630,8 @@ export default function Home() {
                   </form>
                 );
               return (
-                <div key={b.id} className={`group flex items-center rounded-md ${board?.id === b.id ? "bg-sidebar-accent font-medium" : "hover:bg-sidebar-accent/60"}`}>
-                  <button onClick={() => go(b.spaceId, b.id)} className="flex flex-1 min-w-0 items-center gap-2 px-2 py-1.5 text-sm" data-testid={`link-board-${b.id}`}>
+                <div key={b.id} {...dropTarget(b.id, b.id, `“${b.data.title}”`)} className={`group flex items-center rounded-md ${dropBoard === b.id ? "ring-2 ring-primary bg-primary/10" : board?.id === b.id && !activeView ? "bg-sidebar-accent font-medium" : "hover:bg-sidebar-accent/60"}`}>
+                  <button onClick={() => go(b.spaceId, b.id)} className="flex flex-1 min-w-0 items-center gap-2 px-2 py-1.5 text-sm" style={b.depth ? { paddingLeft: `${0.5 + Math.min(b.depth, 4) * 0.85}rem` } : undefined} data-testid={`link-board-${b.id}`}>
                     <Folder className="h-4 w-4 shrink-0 text-muted-foreground" />
                     <span className="flex-1 truncate text-left">{b.data.title}</span>
                     <span className="text-xs text-muted-foreground tabular-nums">{count}</span>
@@ -360,7 +688,29 @@ export default function Home() {
             </div>
           </div>
         )}
+        {plugins.reg.views.length > 0 && (
+          <div>
+            <div className="px-2 pb-1 text-xs font-medium uppercase tracking-wide text-muted-foreground">Plug-ins</div>
+            <div className="space-y-0.5">
+              {plugins.reg.views.map((pv) => (
+                <button
+                  key={pv.uid}
+                  onClick={() => {
+                    setPview({ pluginId: pv.pluginId, viewId: pv.id });
+                    setNavOpen(false);
+                  }}
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm ${activeView?.uid === pv.uid ? "bg-sidebar-accent font-medium" : "hover:bg-sidebar-accent/60"}`}
+                  data-testid={`link-plugin-view-${pv.pluginId}-${pv.id}`}
+                >
+                  {pv.icon ? <PluginIcon icon={pv.icon} className="h-4 w-4 text-muted-foreground" /> : <Puzzle className="h-4 w-4 text-muted-foreground" />}
+                  <span className="flex-1 truncate text-left">{pv.title}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </nav>
+      )}
 
       <div className="border-t px-3 py-3 space-y-2 safe-bottom">
         <button onClick={() => v.sync()} className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-sidebar-accent/60" data-testid="button-sync-status" title="Sync now">
@@ -402,6 +752,7 @@ export default function Home() {
   const heading = q.trim() && allSpaces ? "Search all spaces" : board ? board.data.title : "All notes";
 
   return (
+    <ResourceContext.Provider value={resolver}>
     <div className="flex h-dvh overflow-hidden bg-background">
       <aside className="hidden md:flex w-64 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">{sidebar}</aside>
       <Sheet open={navOpen} onOpenChange={setNavOpen}>
@@ -439,6 +790,7 @@ export default function Home() {
             </div>
           </div>
           <div className="flex-1 hidden lg:block" />
+          {!full && (<>
           <Button
             variant="ghost"
             size="icon"
@@ -449,6 +801,18 @@ export default function Home() {
             data-testid="button-slideshow"
           >
             <GalleryHorizontalEnd className="h-4 w-4" />
+          </Button>
+          <Button
+            variant={sel ? "secondary" : "ghost"}
+            size="icon"
+            aria-label={sel ? "Stop selecting" : "Select notes"}
+            aria-pressed={!!sel}
+            title={sel ? "Stop selecting (Esc)" : "Select notes (or Ctrl+click a note)"}
+            disabled={!visible.length && !sel}
+            onClick={() => setSel(sel ? null : new Set())}
+            data-testid="button-select-notes"
+          >
+            <CheckSquare className="h-4 w-4" />
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -465,7 +829,9 @@ export default function Home() {
               </DropdownMenuRadioGroup>
             </DropdownMenuContent>
           </DropdownMenu>
-          {writable && (
+          </>)}
+          <PluginCommandsMenu ctx={() => ({ ...pctx.current })} />
+          {writable && !full && (
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button className="hidden sm:inline-flex" data-testid="button-new">
@@ -473,6 +839,7 @@ export default function Home() {
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">
+                {kindNewItems()}
                 {NOTE_TYPES.map((t) => (
                   <DropdownMenuItem key={t.type} onClick={() => newNote(t.type)} data-testid={`menu-new-${t.type}`}>
                     <t.icon className="h-4 w-4" /> {t.label}
@@ -482,6 +849,7 @@ export default function Home() {
                 <DropdownMenuItem onClick={() => uploadRef.current?.click()} data-testid="menu-upload-files">
                   <Upload className="h-4 w-4" /> Upload files…
                 </DropdownMenuItem>
+                {templateItems("")}
               </DropdownMenuContent>
             </DropdownMenu>
           )}
@@ -544,6 +912,35 @@ export default function Home() {
               </div>
             ))}
 
+            {activeView ? (
+              <section className="space-y-4" aria-label={activeView.title}>
+                <div className="flex items-center gap-2">
+                  <h1 className="text-base font-semibold" data-testid="text-view-title">{activeView.title}</h1>
+                  <Button variant="ghost" size="sm" className="ml-auto" onClick={() => setPview(null)} data-testid="button-close-plugin-view">
+                    <X className="h-4 w-4" /> Close
+                  </Button>
+                </div>
+                <PluginViewHost key={activeView.uid} view={activeView} ctx={pctx.current} />
+              </section>
+            ) : fullView && space ? (
+              <PluginViewHost key={fullView.uid} view={fullView} ctx={pctx.current} />
+            ) : (<>
+            {joplin && space && <JoplinBar key={space.id} space={space} onSettings={() => setJoplinDlg(true)} />}
+            {kind !== "notes" && !pk && !joplin && (
+              <p className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="text-kind-disabled">This space's special view is turned off on this server, so its items are shown as plain notes.</p>
+            )}
+            {pk && space && pk.tabs && pk.tabs.length > 1 && !(q.trim() && allSpaces) && (
+              <div className="inline-flex rounded-md border p-0.5 text-sm" role="tablist" aria-label={`${pk.title} view`}>
+                {pk.tabs.map((t) => (
+                  <button key={t.id} role="tab" aria-selected={tabId === t.id} type="button" onClick={() => setPtab({ spaceId: space.id, tab: t.id })} className={`inline-flex items-center gap-1.5 rounded px-3 py-1.5 ${tabId === t.id ? "bg-foreground text-background" : "text-muted-foreground hover:bg-muted"}`} data-testid={`tab-${pk.id}-${t.id}`}>
+                    <PluginIcon icon={t.icon} className="h-3.5 w-3.5" /> {t.title}
+                  </button>
+                ))}
+              </div>
+            )}
+            {tabView && space && !(q.trim() && allSpaces) ? (
+              <PluginViewHost key={`${tabView.uid}:${space.id}`} view={tabView} ctx={pctx.current} />
+            ) : (<>
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-base font-semibold mr-2" data-testid="text-view-title">
                 {heading}
@@ -586,15 +983,26 @@ export default function Home() {
             ) : (
               <div className="masonry" data-testid="grid-notes">
                 {visible.map((n) => (
-                  <NoteCard key={n.id} note={n} onOpen={() => setEditor({ note: n, spaceId: n.spaceId, boardId: n.boardId })} boardName={!board && n.boardId ? boardName.get(n.boardId) : undefined} />
+                  <NoteCard
+                    key={n.id}
+                    note={n}
+                    onOpen={() => openNote(n)}
+                    boardName={!board && n.boardId ? boardName.get(n.boardId) : undefined}
+                    selecting={!!sel}
+                    selected={!!sel?.has(n.id)}
+                    onSelect={({ shiftKey }) => toggleSel(n, shiftKey)}
+                    onDragStart={writable ? dragNotes(n) : undefined}
+                  />
                 ))}
               </div>
             )}
+            </>)}
+            </>)}
           </div>
         </div>
       </main>
 
-      {writable && (
+      {writable && !full && !sel && (
         <div className="sm:hidden fixed right-4 z-40" style={{ bottom: "calc(1rem + env(safe-area-inset-bottom))" }}>
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
@@ -603,6 +1011,7 @@ export default function Home() {
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" side="top" className="w-44">
+                {kindNewItems("-mobile")}
             {NOTE_TYPES.map((t) => (
               <DropdownMenuItem key={t.type} onClick={() => newNote(t.type)}>
                 <t.icon className="h-4 w-4" /> {t.label}
@@ -612,14 +1021,40 @@ export default function Home() {
             <DropdownMenuItem onClick={() => uploadRef.current?.click()} data-testid="menu-upload-files-mobile">
               <Upload className="h-4 w-4" /> Upload files…
             </DropdownMenuItem>
+            {templateItems("-mobile")}
           </DropdownMenuContent>
         </DropdownMenu>
         </div>
       )}
 
+      {sel && (
+        <SelectionBar
+          count={selected.length}
+          total={visible.length}
+          writable={selWritable}
+          onAll={() => setSel(new Set(visible.map((n) => n.id)))}
+          onNone={() => setSel(new Set())}
+          onMove={() => setMoving(selected)}
+          onDelete={() => setDeleting(selected)}
+          onExit={() => setSel(null)}
+        />
+      )}
+      <MoveDialog notes={moving} spaceId={space?.id || null} onClose={() => setMoving(null)} onDone={() => (setMoving(null), setSel(null))} />
+      <DeleteNotesDialog notes={deleting} onClose={() => setDeleting(null)} onDone={() => (setDeleting(null), setSel(null))} />
+      <BookmarkRuntime />
+      <BookmarkToolsDialog
+        open={bmTools}
+        onClose={() => setBmTools(false)}
+        spaceId={space?.id || null}
+        onOpen={(n) => {
+          setBmTools(false);
+          openNote(n);
+        }}
+      />
       <NoteEditor
         target={editor}
         onClose={() => setEditor(null)}
+        onOpenNote={openNote}
         onSlideshow={(n) => {
           const i = images.findIndex((x) => x.id === n.id);
           setEditor(null);
@@ -628,8 +1063,12 @@ export default function Home() {
       />
       {slides && <Slideshow notes={slides.notes} start={slides.start} onClose={() => setSlides(null)} />}
       <SpaceDialog open={spaceDlg.open} onOpenChange={(o) => setSpaceDlg({ ...spaceDlg, open: o })} space={spaceDlg.create ? null : space} onCreated={(id) => go(id)} />
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} onReveal={() => setRevealOpen(true)} />
+      <RevealDialog open={revealOpen} onOpenChange={setRevealOpen} />
+      <PluginDialogHost />
+      {joplin && space && <JoplinDialog space={space} open={joplinDlg} onOpenChange={setJoplinDlg} />}
     </div>
+    </ResourceContext.Provider>
   );
 }
 

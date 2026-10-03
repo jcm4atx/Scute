@@ -6,9 +6,18 @@ let onUnauthorized: (() => void) | null = null;
 export function setToken(t: string | null) {
   token = t;
 }
+export function getToken() {
+  return token;
+}
 export function setUnauthorizedHandler(fn: (() => void) | null) {
   onUnauthorized = fn;
 }
+/** Told after every request whether the server could be reached, so "offline" can't get stuck. */
+let onReach: ((ok: boolean) => void) | null = null;
+export function setReachabilityHandler(fn: ((ok: boolean) => void) | null) {
+  onReach = fn;
+}
+const gateway = (status: number) => status >= 502 && status <= 504;
 
 export class ApiError extends Error {
   constructor(
@@ -36,8 +45,10 @@ export async function api<T = any>(method: string, url: string, body?: unknown, 
   try {
     res = await fetch(`${API_BASE}${url}`, { method, headers, body: payload, cache: "no-store" });
   } catch (e) {
+    onReach?.(false);
     throw new NetworkError((e as Error)?.message || "Network error");
   }
+  onReach?.(!gateway(res.status));
   if (res.status === 401 && token && !url.startsWith("/api/auth/")) {
     onUnauthorized?.();
   }
@@ -50,7 +61,7 @@ export async function api<T = any>(method: string, url: string, body?: unknown, 
       /* not json */
     }
     // 502/503/504 from a reverse proxy usually means the server is down: treat as offline
-    if (res.status >= 502 && res.status <= 504) throw new NetworkError(msg);
+    if (gateway(res.status)) throw new NetworkError(`${res.status} ${msg || "from the proxy"}`.trim());
     throw new ApiError(res.status, msg);
   }
   const ct = res.headers.get("content-type") || "";
@@ -66,8 +77,10 @@ export async function apiDownload(url: string, onProgress?: (frac: number) => vo
   try {
     res = await fetch(`${API_BASE}${url}`, { headers, cache: "no-store" });
   } catch (e) {
+    onReach?.(false);
     throw new NetworkError((e as Error)?.message || "Network error");
   }
+  onReach?.(!gateway(res.status));
   if (res.status === 401 && token) onUnauthorized?.();
   if (!res.ok) {
     if (res.status >= 502 && res.status <= 504) throw new NetworkError(res.statusText);

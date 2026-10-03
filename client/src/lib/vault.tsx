@@ -11,9 +11,10 @@ import type {
   SpaceData,
   SyncResponse,
   UserBundle,
+  UserSettings,
 } from "@shared/schema";
 import * as C from "./crypto";
-import { api, ApiError, NetworkError, setToken, setUnauthorizedHandler, apiDownload } from "./api";
+import { api, ApiError, NetworkError, setToken, setUnauthorizedHandler, setReachabilityHandler, apiDownload } from "./api";
 import { idbDel, idbGet, idbSet, idbClearPrefix } from "./idb";
 
 // ---------- decrypted models ----------
@@ -61,6 +62,8 @@ interface RawCache {
   invites: RawInvite[];
   boards: Record<string, RawBoard>;
   notes: Record<string, RawNote>;
+  settings?: string | null;
+  extras?: string[];
 }
 
 interface OutboxOp {
@@ -108,6 +111,11 @@ function useVaultState() {
   const [pending, setPending] = useState(0);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [firstSyncDone, setFirstSyncDone] = useState(false);
+  const [settings, setSettings] = useState<UserSettings>({});
+  const [extras, setExtras] = useState<string[]>([]);
+  const settingsRaw = useRef<string | null>(null);
+  /** Hidden spaces are on show (until hidden again, a reload, or a while in the background). */
+  const [revealed, setRevealed] = useState(false);
 
   const cache = useRef<RawCache>(emptyCache());
   const outbox = useRef<OutboxOp[]>([]);
@@ -136,6 +144,15 @@ function useVaultState() {
     for (const m of c.members) {
       if (!memberMap.has(m.space_id)) memberMap.set(m.space_id, []);
       memberMap.get(m.space_id)!.push(m);
+    }
+    setExtras(c.extras || []);
+    if ((c.settings || null) !== settingsRaw.current) {
+      settingsRaw.current = c.settings || null;
+      try {
+        setSettings(c.settings ? await C.decryptJson<UserSettings>(s.master, c.settings) : {});
+      } catch {
+        setSettings({});
+      }
     }
     const outSpaces: Space[] = [];
     for (const rs of c.spaces) {
@@ -248,6 +265,8 @@ function useVaultState() {
     // re-apply any still-queued local writes on top of server state
     for (const op of outbox.current) applyOptimistic(op);
     c.seq = r.seq;
+    c.settings = r.settings;
+    c.extras = r.extras || [];
   }, []);
 
   function applyOptimistic(op: OutboxOp) {
@@ -390,8 +409,15 @@ function useVaultState() {
     setBoards([]);
     setNotes([]);
     setInvites([]);
+    setRevealed(false);
     setFirstSyncDone(false);
     setStatus("signedOut");
+  }, []);
+
+  // any request that reaches the server (or doesn't) keeps the online flag honest
+  useEffect(() => {
+    setReachabilityHandler((ok) => setOnline(ok));
+    return () => setReachabilityHandler(null);
   }, []);
 
   useEffect(() => {
@@ -586,7 +612,19 @@ function useVaultState() {
         await write("PUT", `/api/notes/${id}`, body, { queueable: false });
         const bytes = new Uint8Array(await input.file.arrayBuffer());
         const encd = await C.encryptBytes(key, bytes);
-        await api("PUT", `/api/files/${id}`, undefined, encd);
+        try {
+          await api("PUT", `/api/files/${id}`, undefined, encd);
+        } catch (e) {
+          // don't leave a note behind that points at a file the server never got
+          try {
+            if (!existing) await api("DELETE", `/api/notes/${id}`);
+            else await api("PUT", `/api/notes/${id}`, { ...body, data: await C.encryptJson(key, existing.data) });
+          } catch {
+            /* offline: the next sync shows the note as it is on the server */
+          }
+          void sync();
+          throw e;
+        }
         fileUrls.current.delete(id);
         if (encd.length <= 12 * 1024 * 1024) await idbSet(prefix() + "file:" + id, encd);
         await sync();
@@ -596,6 +634,49 @@ function useVaultState() {
       return id;
     },
     [write, sync],
+  );
+
+  /** Save many notes at once (imports). Needs a connection; syncs once at the end. */
+  const saveNotesBulk = useCallback(
+    async (spaceId: string, items: { id: string; boardId?: string | null; data: NoteData }[], onProgress?: (done: number, total: number) => void) => {
+      const sp = spaceKeys.current.get(spaceId);
+      if (!sp) throw new Error("Unknown space");
+      let done = 0;
+      let next = 0;
+      const worker = async () => {
+        while (next < items.length) {
+          const it = items[next++];
+          const existing = noteCache.current.get(it.id)?.note;
+          const key = existing?.key || (await C.newAesKey(true));
+          await api("PUT", `/api/notes/${it.id}`, {
+            spaceId,
+            boardId: it.boardId ?? null,
+            encKey: await C.wrapKey(sp.key, key),
+            data: await C.encryptJson(key, it.data),
+          });
+          onProgress?.(++done, items.length);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(6, items.length) }, worker));
+      await sync();
+    },
+    [sync],
+  );
+
+  /** Merge and save encrypted account preferences. */
+  const saveSettings = useCallback(
+    async (patch: Partial<UserSettings>) => {
+      const s = sess.current;
+      if (!s) return;
+      const next = { ...settings, ...patch };
+      const enc = await C.encryptJson(s.master, next);
+      await api("PUT", "/api/me/settings", { data: enc });
+      cache.current.settings = enc;
+      settingsRaw.current = enc;
+      setSettings(next);
+      await persist();
+    },
+    [settings, persist],
   );
 
   const deleteNote = useCallback(
@@ -620,6 +701,18 @@ function useVaultState() {
     fileUrls.current.set(note.id, url);
     return url;
   }, []);
+
+  /** Decrypted attachment as a Blob (used by Joplin sync to upload resources). */
+  const fileBlob = useCallback(
+    async (note: Note): Promise<Blob> => {
+      const url = await getFileUrl(note);
+      return await (await fetch(url)).blob();
+    },
+    [getFileUrl],
+  );
+
+  /** Ids of notes/boards deleted from a space (server keeps tombstones). */
+  const tombstones = useCallback((spaceId: string) => api<{ notes: string[]; boards: string[] }>("GET", `/api/spaces/${spaceId}/tombstones`), []);
 
   // ---------- export / import ----------
   const exportData = useCallback(
@@ -730,6 +823,66 @@ function useVaultState() {
     [createSpace, saveBoard, saveNote, sync],
   );
 
+  // ---------- hidden spaces ----------
+  /** True if this is the account password (checked here, against the account's own key; works offline). */
+  const checkPassword = useCallback(async (password: string) => {
+    const s = sess.current;
+    if (!s) return false;
+    let u: UserBundle = s.user;
+    try {
+      u = (await api<{ user: UserBundle }>("GET", "/api/me")).user;
+    } catch {
+      /* offline: the copy from sign-in */
+    }
+    try {
+      const { kek } = await C.deriveFromPassword(password, u.kdfSalt, u.kdfIter);
+      await C.unwrapKey(kek, u.encMaster, false);
+      return true;
+    } catch {
+      return false;
+    }
+  }, []);
+  const hiddenKey = (settings.hiddenSpaces || []).join(",");
+  const hiddenNow = useMemo(() => new Set(revealed || !hiddenKey ? [] : hiddenKey.split(",")), [revealed, hiddenKey]);
+  const shownSpaces = useMemo(() => (hiddenNow.size ? spaces.filter((x) => !hiddenNow.has(x.id)) : spaces), [spaces, hiddenNow]);
+  const shownBoards = useMemo(() => (hiddenNow.size ? boards.filter((x) => !hiddenNow.has(x.spaceId)) : boards), [boards, hiddenNow]);
+  const shownNotes = useMemo(() => (hiddenNow.size ? notes.filter((x) => !hiddenNow.has(x.spaceId)) : notes), [notes, hiddenNow]);
+  const reveal = useCallback(() => setRevealed(true), []);
+  const conceal = useCallback(() => setRevealed(false), []);
+  /** Hide or show one space; hiding also puts every hidden space away again. */
+  const setSpaceHidden = useCallback(
+    async (id: string, hide: boolean) => {
+      const cur = settings.hiddenSpaces || [];
+      const next = hide ? [...new Set([...cur, id])] : cur.filter((x) => x !== id);
+      await saveSettings({ hiddenSpaces: next, ...(hide && settings.defaultSpaceId === id ? { defaultSpaceId: null } : {}) });
+      if (hide) setRevealed(false);
+    },
+    [settings, saveSettings],
+  );
+  // put them away again after five minutes in the background
+  useEffect(() => {
+    if (!revealed) return;
+    let away = 0;
+    const onVis = () => {
+      if (document.visibilityState === "hidden") away = Date.now();
+      else if (away && Date.now() - away > 5 * 60_000) setRevealed(false);
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => document.removeEventListener("visibilitychange", onVis);
+  }, [revealed]);
+  // forget spaces that are gone
+  useEffect(() => {
+    if (!firstSyncDone || !hiddenKey || !spaces.length) return;
+    const ids = hiddenKey.split(",");
+    const live = ids.filter((id) => spaces.some((x) => x.id === id));
+    if (live.length !== ids.length) void saveSettings({ hiddenSpaces: live }).catch(() => {});
+  }, [firstSyncDone, hiddenKey, spaces]); // eslint-disable-line
+
+  // back in touch: send what's waiting
+  useEffect(() => {
+    if (online && pending && status === "ready") void sync();
+  }, [online]); // eslint-disable-line
+
   // ---------- lifecycle: polling + connectivity ----------
   useEffect(() => {
     if (status !== "ready") return;
@@ -760,9 +913,17 @@ function useVaultState() {
       status,
       session,
       user: session?.user || null,
-      spaces,
-      boards,
-      notes,
+      /** Spaces, boards and notes on show: hidden spaces (and everything in them) are left out unless revealed. */
+      spaces: shownSpaces,
+      boards: shownBoards,
+      notes: shownNotes,
+      /** Every space, hidden ones included (for Settings). */
+      allSpaces: spaces,
+      revealed,
+      reveal,
+      conceal,
+      setSpaceHidden,
+      checkPassword,
       invites,
       online,
       syncing,
@@ -770,6 +931,10 @@ function useVaultState() {
       pending,
       syncError,
       firstSyncDone,
+      settings,
+      extras,
+      saveSettings,
+      saveNotesBulk,
       login,
       register,
       logout,
@@ -789,13 +954,15 @@ function useVaultState() {
       saveNote,
       deleteNote,
       getFileUrl,
+      fileBlob,
+      tombstones,
       exportData,
       importData,
     }),
     [
-      status, session, spaces, boards, notes, invites, online, syncing, lastSync, pending, syncError, firstSyncDone,
+      status, session, shownSpaces, shownBoards, shownNotes, spaces, revealed, reveal, conceal, setSpaceHidden, checkPassword, invites, online, syncing, lastSync, pending, syncError, firstSyncDone, settings, extras, saveSettings, saveNotesBulk,
       login, register, logout, changePassword, deleteAccount, sync, createSpace, updateSpace, deleteSpace, inviteMember,
-      setMemberRole, removeMember, acceptInvite, declineInvite, saveBoard, deleteBoard, saveNote, deleteNote, getFileUrl,
+      setMemberRole, removeMember, acceptInvite, declineInvite, saveBoard, deleteBoard, saveNote, deleteNote, getFileUrl, fileBlob, tombstones,
       exportData, importData,
     ],
   );

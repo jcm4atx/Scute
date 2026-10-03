@@ -11,6 +11,12 @@ services:
       SCUTE_SESSION_DAYS: "90"
       SCUTE_TRUST_PROXY: "1"
       # SCUTE_JOPLIN_URLS: "https://joplin.example.com"   # optional allow list for Joplin Server sync
-      # SCUTE_EXTRAS: "gedcom,cycles"
+      # SCUTE_PLUGINS: "off"   # plug-ins are on by default; installed ones live in ./data/plugins
+      # SCUTE_ARCHIVE_PRIVATE: "on"   # let bookmark previews/saved copies reach LAN addresses
+      # SCUTE_ARCHIVE_MAX_MB: "200"   # largest page or file a bookmark will save
+      # SCUTE_PLUGIN_NET: "http://host.docker.internal:11434"   # addresses plug-ins may reach through the server
+      # SCUTE_SHARES: "off"   # published shares at /shared/ are on by default
+      # SCUTE_DRIVE_QUOTA_GB: "100"   # Scute Drive (WebDAV at /dav/): files in ./data/drive/<user>/
+    # extra_hosts: ["host.docker.internal:host-gateway"]   # lets the container reach services on the Docker host
     volumes:
       - ./data:/data

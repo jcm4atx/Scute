@@ -1,4 +1,5 @@
 // Helpers for video/audio: poster frames, embeddable links, formatting.
+import type { FileMeta, NoteData } from "@shared/schema";
 
 export type Embed =
   | { kind: "youtube"; id: string; src: string; label: string }
@@ -192,4 +193,39 @@ export function detectType(f: File): "image" | "video" | "file" {
   if (t.startsWith("image/")) return "image";
   if (t.startsWith("video/")) return "video";
   return "file";
+}
+
+/** A small JPEG preview of an image file (kept inline, encrypted, in the note). */
+export async function makeThumb(file: File): Promise<{ thumb: string; width: number; height: number } | null> {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 560 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * scale);
+    c.height = Math.round(bmp.height * scale);
+    const ctx = c.getContext("2d")!;
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, c.width, c.height);
+    ctx.drawImage(bmp, 0, 0, c.width, c.height);
+    return { thumb: c.toDataURL("image/jpeg", 0.72), width: bmp.width, height: bmp.height };
+  } catch {
+    return null;
+  }
+}
+
+/** Build the note fields (type, title, metadata, thumbnail) for one attachment. */
+export async function describeFile(f: File): Promise<Pick<NoteData, "type" | "title" | "file" | "thumb">> {
+  const type = detectType(f);
+  const meta: FileMeta = { name: f.name, type: f.type || guessMime(f.name), size: f.size };
+  const title = f.name.replace(/\.[^.]+$/, "");
+  if (type === "image") {
+    const t = await makeThumb(f);
+    return { type, title, file: { ...meta, width: t?.width, height: t?.height }, thumb: t?.thumb || null };
+  }
+  if (type === "video") {
+    const p = await makeVideoPoster(f);
+    return { type, title, file: { ...meta, width: p?.width, height: p?.height, duration: p?.duration }, thumb: p?.thumb || null };
+  }
+  if (isAudioMime(meta.type)) return { type, title, file: { ...meta, duration: await audioDuration(f) }, thumb: null };
+  return { type, title: f.name, file: meta, thumb: null };
 }

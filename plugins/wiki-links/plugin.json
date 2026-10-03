@@ -1,0 +1,10 @@
+{
+  "id": "wiki-links",
+  "name": "Wiki links",
+  "version": "1.0.0",
+  "description": "Write [[Note title]] to link notes together. Click a link to open the note, or create it if it doesn't exist yet. Adds a Backlinks button to every note.",
+  "author": "Scute",
+  "main": "main.js",
+  "styles": "style.css",
+  "permissions": ["notes:read", "notes:write"]
+}

@@ -8,8 +8,11 @@ import { Label } from "@/components/ui/label";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useToast } from "@/hooks/use-toast";
-import type { Role } from "@shared/schema";
+import type { Role, SpaceKind } from "@shared/schema";
 import { SPACE_COLORS, canManage, useVault, type Space } from "@/lib/vault";
+import { PluginsSettings } from "@/components/plugin-ui";
+import { HiddenSpacesSettings } from "@/components/hidden-spaces";
+import { usePlugins } from "@/lib/plugins";
 import { api } from "@/lib/api";
 import { Crown, Download, Loader2, LogOut, MonitorSmartphone, Trash2, Upload, UserPlus } from "lucide-react";
 
@@ -26,13 +29,16 @@ export function SpaceDialog({
   onOpenChange,
   space,
   onCreated,
+  initialKind,
 }: {
   open: boolean;
   onOpenChange: (o: boolean) => void;
   space: Space | null; // null = create
   onCreated?: (id: string) => void;
+  initialKind?: SpaceKind;
 }) {
   const v = useVault();
+  const plugins = usePlugins();
   const { toast } = useToast();
   const [title, setTitle] = useState("");
   const [color, setColor] = useState(SPACE_COLORS[0]);
@@ -41,6 +47,8 @@ export function SpaceDialog({
   const [invRole, setInvRole] = useState<Role>("member");
   const [lastFp, setLastFp] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState("");
+  const [kind, setKind] = useState<SpaceKind>("notes");
+  const [makeDefault, setMakeDefault] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -49,8 +57,15 @@ export function SpaceDialog({
     setInvUser("");
     setLastFp(null);
     setConfirmDelete("");
+    setKind(initialKind || "notes");
+    setMakeDefault(false);
   }, [open, space?.id]); // eslint-disable-line
 
+  const kinds: { value: SpaceKind; label: string }[] = [
+    { value: "notes", label: "Notes" },
+    ...plugins.reg.spaceKinds.map((k) => ({ value: k.id, label: k.title })),
+    ...(v.extras.includes("joplin") ? [{ value: "joplin" as const, label: "Joplin Server sync" }] : []),
+  ];
   const live = space ? v.spaces.find((s) => s.id === space.id) || space : null;
   const manage = canManage(live?.role);
   const me = v.user?.id;
@@ -60,10 +75,11 @@ export function SpaceDialog({
     setBusy(true);
     try {
       if (live) {
-        await v.updateSpace(live, { title: title.trim(), color });
+        await v.updateSpace(live, { ...live.data, title: title.trim(), color });
         toast({ title: "Space updated" });
       } else {
-        const id = await v.createSpace({ title: title.trim(), color });
+        const id = await v.createSpace(kind === "notes" ? { title: title.trim(), color } : { title: title.trim(), color, kind });
+        if (makeDefault) await v.saveSettings({ defaultSpaceId: id });
         onCreated?.(id);
         onOpenChange(false);
       }
@@ -113,6 +129,70 @@ export function SpaceDialog({
               ))}
             </div>
           </div>
+          {!live && kinds.length > 1 && (
+            <div className="space-y-1.5">
+              <Label>Kind</Label>
+              <Select
+                value={kind}
+                onValueChange={(k) => {
+                  setKind(k as SpaceKind);
+                  if (k === "joplin" && !title.trim()) setTitle("Joplin");
+                }}
+              >
+                <SelectTrigger data-testid="select-space-kind">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {kinds.map((k) => (
+                    <SelectItem key={k.value} value={k.value}>
+                      {k.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {kind === "joplin" && (
+                <p className="text-xs text-muted-foreground" data-testid="text-kind-joplin">
+                  Notebooks, notes, tags and attachments in this space stay in sync with a Joplin Server account. You'll enter the server details next.
+                </p>
+              )}
+            </div>
+          )}
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox
+              checked={live ? v.settings.defaultSpaceId === live.id : makeDefault}
+              onCheckedChange={async (c) => {
+                if (!live) return setMakeDefault(!!c);
+                try {
+                  await v.saveSettings({ defaultSpaceId: c ? live.id : null });
+                  toast({ title: c ? "Default space set" : "Default space cleared", description: c ? `Scute will open ${live.data.title} when it starts.` : "Scute will open the space you used last." });
+                } catch (e) {
+                  toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" });
+                }
+              }}
+              data-testid="checkbox-default-space"
+            />
+            Open this space when Scute starts
+          </label>
+          {live && (
+            <label className="flex items-center gap-2 text-sm">
+              <Checkbox
+                checked={(v.settings.hiddenSpaces || []).includes(live.id)}
+                onCheckedChange={async (c) => {
+                  try {
+                    await v.setSpaceHidden(live.id, !!c);
+                    if (c) {
+                      onOpenChange(false);
+                      toast({ title: "Space hidden", description: "Show hidden spaces from the space menu or Settings, or with Ctrl+Alt+H." });
+                    }
+                  } catch (e) {
+                    toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" });
+                  }
+                }}
+                data-testid="checkbox-hide-space"
+              />
+              Hide this space on my devices
+            </label>
+          )}
           {(!live || manage) && (
             <div className="flex justify-end">
               <Button onClick={saveMeta} disabled={busy || !title.trim()} data-testid="button-save-space">
@@ -244,7 +324,7 @@ interface SessionRow {
   current: boolean;
 }
 
-export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o: boolean) => void }) {
+export function SettingsDialog({ open, onOpenChange, onReveal }: { open: boolean; onOpenChange: (o: boolean) => void; onReveal?: () => void }) {
   const v = useVault();
   const { toast } = useToast();
   const [cur, setCur] = useState("");
@@ -340,14 +420,49 @@ export function SettingsDialog({ open, onOpenChange }: { open: boolean; onOpenCh
           </DialogDescription>
         </DialogHeader>
         <Tabs defaultValue="account">
-          <TabsList className="grid grid-cols-3 w-full">
+          <TabsList className="grid grid-cols-4 w-full">
             <TabsTrigger value="account" data-testid="tab-account">Account</TabsTrigger>
             <TabsTrigger value="devices" data-testid="tab-devices">Devices</TabsTrigger>
             <TabsTrigger value="data" data-testid="tab-data">Data</TabsTrigger>
+            <TabsTrigger value="plugins" data-testid="tab-plugins">Plug-ins</TabsTrigger>
           </TabsList>
 
+          <TabsContent value="plugins" className="pt-3">
+            <PluginsSettings />
+          </TabsContent>
+
           <TabsContent value="account" className="space-y-6 pt-3">
-            <form onSubmit={changePw} className="space-y-3">
+            <div className="space-y-2">
+              <h3 className="text-sm font-semibold">Default space</h3>
+              <p className="text-xs text-muted-foreground">The space Scute opens when it starts. Saved with your account, so it applies on every device.</p>
+              <Select
+                value={v.settings.defaultSpaceId && v.spaces.some((s) => s.id === v.settings.defaultSpaceId) ? v.settings.defaultSpaceId : "__last"}
+                onValueChange={async (id) => {
+                  try {
+                    await v.saveSettings({ defaultSpaceId: id === "__last" ? null : id });
+                    toast({ title: "Default space saved" });
+                  } catch (e) {
+                    toast({ title: "Couldn't save", description: (e as Error).message, variant: "destructive" });
+                  }
+                }}
+              >
+                <SelectTrigger data-testid="select-default-space">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__last">The space I used last</SelectItem>
+                  {v.spaces.map((s) => (
+                    <SelectItem key={s.id} value={s.id}>
+                      {s.data.title}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            <div className="border-t pt-4">
+              <HiddenSpacesSettings onReveal={() => onReveal?.()} />
+            </div>
+            <form onSubmit={changePw} className="space-y-3 border-t pt-4">
               <h3 className="text-sm font-semibold">Change password</h3>
               <p className="text-xs text-muted-foreground">Your master key is re-wrapped with the new password. Notes don't need to be re-encrypted.</p>
               <Input type="password" placeholder="Current password" autoComplete="current-password" value={cur} onChange={(e) => setCur(e.target.value)} data-testid="input-current-password" />

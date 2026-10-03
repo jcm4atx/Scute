@@ -1,0 +1,10 @@
+{
+  "id": "space-stats",
+  "name": "Space stats",
+  "version": "1.0.0",
+  "description": "A dashboard view: what's in the current space, top tags, and what changed recently.",
+  "author": "Scute",
+  "main": "main.js",
+  "styles": "style.css",
+  "permissions": ["notes:read"]
+}
