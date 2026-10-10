@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DATA_DIR, db } from "./storage";
-import { PLUGINS_ON, listPlugins } from "./plugins";
+import { listPlugins } from "./plugins";
 
 /**
  * Published shares (plug-in API 6, "publish" permission).
@@ -18,7 +18,8 @@ import { PLUGINS_ON, listPlugins } from "./plugins";
  */
 
 const off = (v: string | undefined, d: string) => ["off", "0", "false", "no"].includes((v || d).toLowerCase());
-export const SHARES_ON = PLUGINS_ON && !off(process.env.SCUTE_SHARES, "on");
+// Shares of saved bookmark copies are built in (1.18.0), so they don't need plug-ins.
+export const SHARES_ON = !off(process.env.SCUTE_SHARES, "on");
 const MAX_MB = Number(process.env.SCUTE_SHARE_MAX_MB || 4096); // per share
 const MAX_FILE_MB = Number(process.env.SCUTE_MAX_UPLOAD_MB || 200);
 const SHARES_DIR = path.join(DATA_DIR, "shares");
@@ -90,7 +91,22 @@ function listFiles(dir: string): string[] {
 function viewerOf(pluginId: string): string | null {
   return viewerInfo(pluginId)?.file || null;
 }
-function viewerInfo(pluginId: string): { file: string; allow: string[] } | null {
+/**
+ * Scute's own share viewers (not plug-ins): "@scute/saved-copy" shows a shared
+ * saved copy of a bookmark (page, image, video or file). Plug-in ids can't start
+ * with "@", so these never clash with one.
+ */
+const BUILTIN_VIEWERS: Record<string, string> = { "@scute/saved-copy": "saved-copy.html" };
+const VIEWER_DIR = [path.resolve(__dirname, "viewers"), path.resolve(process.cwd(), "dist", "viewers")].find((d) => fs.existsSync(d));
+export const builtinViewer = (id: string) => {
+  const f = BUILTIN_VIEWERS[id] && VIEWER_DIR ? path.join(VIEWER_DIR, BUILTIN_VIEWERS[id]) : null;
+  return f && fs.existsSync(f) ? f : null;
+};
+function viewerInfo(pluginId: string): { file: string; allow: string[]; builtin?: boolean } | null {
+  if (pluginId.startsWith("@")) {
+    const f = builtinViewer(pluginId);
+    return f ? { file: f, allow: [], builtin: true } : null;
+  }
   const p = listPlugins().find((x) => x.id === pluginId && x.enabled && !x.error);
   if (!p || !p.permissions.includes("publish") || !p.shareViewer) return null;
   const f = path.join(p.dir, p.shareViewer);
@@ -295,6 +311,10 @@ export function registerShareRoutes(
     auth,
     wrap((req, res) => {
       const slug = String(req.params.slug);
+      // Taking down something that's already gone is fine: the plug-in's own
+      // record can outlive the share (an older database restored, a crash
+      // between steps), and it should still be able to clean up.
+      if (SLUG_RE.test(slug) && !row(slug)) return res.json({ ok: true, gone: true });
       mine(req, slug);
       fs.rmSync(shareDir(slug), { recursive: true, force: true });
       db.prepare("DELETE FROM shares WHERE slug = ?").run(slug);
@@ -318,7 +338,7 @@ export function registerShareRoutes(
     if (r.expires && r.expires < Date.now()) return { err: [410, "This share has expired."] as const };
     const v = viewerInfo(r.plugin);
     if (!v) return { err: [404, "Nothing is shared here."] as const };
-    return { r, viewer: v.file, allow: v.allow };
+    return { r, viewer: v.file, allow: v.allow, builtin: !!v.builtin };
   };
 
   app.get(/^\/shared\/([a-z0-9-]{1,64})(?:\/|\/index\.html)?$/, (req, res, next) => {
@@ -330,7 +350,11 @@ export function registerShareRoutes(
       "X-Robots-Tag": "noindex, nofollow",
       "Referrer-Policy": "no-referrer",
       "Cross-Origin-Opener-Policy": "same-origin",
-      "Content-Security-Policy": viewerCsp(s.allow!),
+      // The saved-copy viewer shows the copied page in a sandboxed srcdoc frame, which
+      // inherits this policy: no scripts there, and nothing loads from the web.
+      "Content-Security-Policy": s.builtin
+        ? "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src 'self'; font-src data:; frame-src 'self' blob:; base-uri 'none'; form-action 'none'"
+        : viewerCsp(s.allow!),
     });
     res.type("html").sendFile(s.viewer, (err) => err && next(err));
   });

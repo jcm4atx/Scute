@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ChevronLeft, ChevronRight, Loader2, Maximize, Minimize, Pause, Play, Shuffle, X } from "lucide-react";
 import { useVault, type Note } from "@/lib/vault";
+import { fileError } from "@/components/note-parts";
 
 const SPEEDS = [3, 5, 8, 15];
 
@@ -26,7 +27,7 @@ export function Slideshow({ notes, start, onClose }: { notes: Note[]; start: num
   const [speed, setSpeed] = useState(() => Number(localStorage.getItem("scute:slide-speed")) || 5);
   const [shuffle, setShuffle] = useState(false);
   const [urls, setUrls] = useState<Record<string, string>>({});
-  const [failed, setFailed] = useState<Record<string, boolean>>({});
+  const [failed, setFailed] = useState<Record<string, string>>({});
   const [chrome, setChrome] = useState(true);
   const [full, setFull] = useState(false);
   const root = useRef<HTMLDivElement>(null);
@@ -43,8 +44,8 @@ export function Slideshow({ notes, start, onClose }: { notes: Note[]; start: num
       try {
         const url = await v.getFileUrl(note);
         setUrls((u) => ({ ...u, [note.id]: url }));
-      } catch {
-        setFailed((f) => ({ ...f, [note.id]: true }));
+      } catch (e) {
+        setFailed((f) => ({ ...f, [note.id]: fileError(e) }));
       }
     },
     [urls, failed, v],
@@ -161,7 +162,7 @@ export function Slideshow({ notes, start, onClose }: { notes: Note[]; start: num
         {!src && cur.data.thumb && <img src={cur.data.thumb} alt="" className="absolute h-full w-full object-contain blur-md opacity-60" />}
         {src && <img key={cur.id} src={src} alt={title} className="slide-in max-h-full max-w-full object-contain" draggable={false} data-testid="img-slide" />}
         {!src && !failed[cur.id] && <Loader2 className="relative h-8 w-8 animate-spin text-white/70" />}
-        {failed[cur.id] && <p className="relative text-sm text-white/70">This image couldn't be decrypted.</p>}
+        {failed[cur.id] && <p className="relative text-sm text-white/70">{failed[cur.id]}</p>}
       </div>
 
       {/* Progress bar for the current slide */}

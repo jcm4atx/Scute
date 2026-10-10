@@ -147,6 +147,14 @@ export async function openSealedKey(priv: CryptoKey, b64: string): Promise<Crypt
   return importAesRaw(await decryptBytes(shared, data.slice(66)), true);
 }
 
+/** Open bytes the server sealed to this user's public key (inbox, 1.19.0): [3][epk 65][encryptBytes blob]. */
+export async function openSealedBytes(priv: CryptoKey, b64: string): Promise<Uint8Array> {
+  const data = fromB64(b64);
+  if (data[0] !== 3) throw new Error("Unknown sealed-data version");
+  const epk = await subtle().importKey("raw", data.slice(1, 66), { name: "ECDH", namedCurve: "P-256" }, false, []);
+  return decryptBytes(await ecdhAes(priv, epk), data.slice(66));
+}
+
 /** Short, human-comparable fingerprint of a public key (for verifying shares). */
 export async function fingerprint(pubB64: string): Promise<string> {
   const h = new Uint8Array(await subtle().digest("SHA-256", fromB64(pubB64)));

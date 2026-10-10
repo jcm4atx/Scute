@@ -1,6 +1,6 @@
 import { build as esbuild } from "esbuild";
 import { build as viteBuild } from "vite";
-import { rm, readFile, cp } from "node:fs/promises";
+import { rm, readFile, cp, mkdir, writeFile } from "node:fs/promises";
 
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
@@ -57,6 +57,15 @@ async function buildAll() {
     external: externals,
     logLevel: "info",
   });
+
+  // Scute's own share viewers: one self-contained HTML file each
+  console.log("building share viewers...");
+  await mkdir("dist/viewers", { recursive: true });
+  for (const name of ["saved-copy"]) {
+    const js = await esbuild({ entryPoints: [`client/src/share/${name}.ts`], bundle: true, format: "iife", target: "es2020", minify: true, write: false, logLevel: "warning" });
+    const html = (await readFile(`client/src/share/${name}.html`, "utf-8")).replace("/*SCRIPT*/", () => js.outputFiles[0].text.replace(/<\/script/gi, "<\\/script"));
+    await writeFile(`dist/viewers/${name}.html`, html);
+  }
 
   // bundled example plug-ins (served read-only, off until an admin enables them)
   await cp("plugins", "dist/plugins", { recursive: true });

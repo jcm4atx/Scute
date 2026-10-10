@@ -691,12 +691,24 @@ function useVaultState() {
   const getFileUrl = useCallback(async (note: Note, onProgress?: (frac: number) => void): Promise<string> => {
     const hit = fileUrls.current.get(note.id);
     if (hit) return hit;
-    let bytes = await idbGet<Uint8Array>(prefix() + "file:" + note.id);
-    if (!bytes) {
-      bytes = await apiDownload(`/api/files/${note.id}`, onProgress);
-      if (bytes.length <= 12 * 1024 * 1024) void idbSet(prefix() + "file:" + note.id, bytes);
+    const cacheKey = prefix() + "file:" + note.id;
+    let plain: Uint8Array | null = null;
+    const cached = await idbGet<Uint8Array>(cacheKey);
+    if (cached) {
+      try {
+        plain = await C.decryptBytes(note.key, cached);
+      } catch {
+        // A damaged copy on this device (older versions could keep a cut-off
+        // download): drop it and fetch the file again.
+        await idbDel(cacheKey);
+      }
     }
-    const plain = await C.decryptBytes(note.key, bytes);
+    if (!plain) {
+      const bytes = await apiDownload(`/api/files/${note.id}`, onProgress);
+      plain = await C.decryptBytes(note.key, bytes);
+      // only keep copies that are known to be good
+      if (bytes.length <= 12 * 1024 * 1024) void idbSet(cacheKey, bytes);
+    }
     const url = URL.createObjectURL(new Blob([plain], { type: note.data.file?.type || "application/octet-stream" }));
     fileUrls.current.set(note.id, url);
     return url;

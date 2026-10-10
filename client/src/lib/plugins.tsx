@@ -9,6 +9,8 @@
  * honest declaration, not a sandbox. Only the server admin can install them.
  */
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { publishFiles } from "./shares";
+import { openSealedBytes } from "./crypto";
 import DOMPurify from "dompurify";
 import { APP_VERSION } from "@shared/version";
 import type { NoteData, NoteType } from "@shared/schema";
@@ -284,6 +286,17 @@ function guard<A extends unknown[], R>(pluginId: string, what: string, fn: (...a
 export const runGuarded = (pluginId: string, what: string, fn: () => unknown) => guard(pluginId, what, fn, undefined)();
 
 // ---------------------------------------------------------------- Scute Drive (API 8)
+interface InboxEndpoint {
+  id: string;
+  label: string;
+  created: number;
+  lastUsed: number | null;
+  received: number;
+  waiting: number;
+  path: string;
+}
+const withUrl = <T extends InboxEndpoint>(e: T) => ({ ...e, url: new URL(`${API_BASE}${e.path}`, location.href).href });
+
 const davPath = (rel: string) => `${API_BASE}/dav/${rel.split("/").filter(Boolean).map(encodeURIComponent).join("/")}`;
 async function davFetch(method: string, rel: string, init: { headers?: Record<string, string>; body?: BodyInit; signal?: AbortSignal } = {}) {
   const headers: Record<string, string> = { ...(init.headers || {}) };
@@ -531,23 +544,8 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
     name: string,
     opts: { files: string[]; produce: (file: string) => Promise<Blob | Uint8Array | string>; expires?: number | null; onProgress?: (done: number, total: number) => void; signal?: AbortSignal },
   ) {
-    const slug = encodeURIComponent(name);
-    const begin = await api<{ version: string; have: string[] }>("POST", `/api/shares/${slug}/begin`, { plugin: p.id });
-    const have = new Set(begin.have);
-    const todo = opts.files.filter((f) => f === "share.json" || !have.has(f));
     const prog = opts.onProgress ? guard(p.id, "publish progress", opts.onProgress, undefined) : undefined;
-    let done = 0;
-    prog?.(0, todo.length);
-    for (const f of todo) {
-      if (opts.signal?.aborted) throw new DOMException("Cancelled", "AbortError");
-      const data = await opts.produce(f);
-      const body = typeof data === "string" ? new Blob([data]) : data instanceof Blob ? data : new Blob([data as BlobPart]);
-      await api("PUT", `/api/shares/${slug}/${begin.version}/${f.split("/").map(encodeURIComponent).join("/")}`, undefined, body);
-      prog?.(++done, todo.length);
-    }
-    const body: Record<string, unknown> = { files: opts.files };
-    if (opts.expires !== undefined) body.expires = opts.expires;
-    return api<ShareInfo>("POST", `/api/shares/${slug}/${begin.version}/commit`, body);
+    return publishFiles(p.id, name, { ...opts, onProgress: prog });
   }
   const own = <T extends object>(kind: keyof Registry, item: T, id: string) => {
     const uid = `${p.id}:${id}`;
@@ -625,7 +623,7 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
 
   const scute = {
     version: APP_VERSION,
-    apiVersion: 8,
+    apiVersion: 10,
     plugin: { id: p.id, name: p.name, version: p.version, permissions: [...p.permissions] },
 
     commands: {
@@ -1039,6 +1037,91 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
      * (unencrypted) files at /dav/. Paths are "a/b/c.txt", relative to the drive.
      */
     drive: driveApi(() => need("drive")),
+    /**
+     * API 9 (inbox): web addresses other apps send data to (OwnTracks, Overland,
+     * GPSLogger…). The server seals each request to your public key on arrival;
+     * fetch() opens them here. Store what you need, then ack() so the server forgets them.
+     */
+    inbox: {
+      async info() {
+        need("inbox");
+        const r = await api<{ enabled: boolean; maxKb: number; endpoints: InboxEndpoint[] }>("GET", `/api/inbox?plugin=${encodeURIComponent(p.id)}`);
+        return { ...r, endpoints: r.endpoints.map(withUrl), base: new URL(`${API_BASE}/in/`, location.href).href };
+      },
+      async create(opts: { label?: string } = {}) {
+        need("inbox");
+        return withUrl(await api<InboxEndpoint & { secret: string }>("POST", "/api/inbox", { plugin: p.id, label: opts.label || "" }));
+      },
+      async update(id: string, opts: { label?: string; newSecret?: boolean }) {
+        need("inbox");
+        return withUrl(await api<InboxEndpoint & { secret?: string }>("PATCH", `/api/inbox/${encodeURIComponent(id)}?plugin=${encodeURIComponent(p.id)}`, { label: opts.label, newSecret: !!opts.newSecret }));
+      },
+      async remove(id: string) {
+        need("inbox");
+        await api("DELETE", `/api/inbox/${encodeURIComponent(id)}?plugin=${encodeURIComponent(p.id)}`);
+      },
+      /** Up to `limit` waiting requests (oldest first), decrypted. Items that can't be opened come back with `error`. */
+      async fetch(opts: { limit?: number; after?: number } = {}) {
+        need("inbox");
+        const priv = vRef.current.session?.priv;
+        if (!priv) throw new Error("Not signed in");
+        const r = await api<{ items: { id: number; endpoint: string; received: number; sealed: string }[]; more: boolean }>(
+          "GET",
+          `/api/inbox-items?plugin=${encodeURIComponent(p.id)}&limit=${Math.min(1000, opts.limit || 500)}&after=${opts.after || 0}`,
+        );
+        const td = new TextDecoder();
+        const items = await Promise.all(
+          r.items.map(async (it) => {
+            try {
+              const j = JSON.parse(td.decode(await openSealedBytes(priv, it.sealed)));
+              return { id: it.id, endpoint: it.endpoint, received: it.received, method: j.method, contentType: j.contentType, query: j.query || {}, headers: j.headers || {}, body: j.body || "", base64: !!j.base64 };
+            } catch (e) {
+              return { id: it.id, endpoint: it.endpoint, received: it.received, error: (e as Error).message || "couldn't decrypt" };
+            }
+          }),
+        );
+        return { items, more: r.more };
+      },
+      async ack(ids: number[]) {
+        need("inbox");
+        let n = 0;
+        for (let i = 0; i < ids.length; i += 5000) n += (await api<{ deleted: number }>("POST", "/api/inbox-items/delete", { plugin: p.id, ids: ids.slice(i, i + 5000) })).deleted;
+        return n;
+      },
+    },
+    /**
+     * API 10 (fediverse): the user's Fediverse account (@name@SCUTE_FEDI_DOMAIN).
+     * token() gives a Mastodon-API access token for this device; call Mastodon's
+     * client API at `${api}/api/v1/…` with "Authorization: Bearer <token>".
+     */
+    fedi: {
+      async info() {
+        need("fediverse");
+        const r = await api<any>("GET", "/api/fedi");
+        return { ...r, api: new URL(`${API_BASE}/`, location.href).href.replace(/\/$/, "") };
+      },
+      async createAccount(opts: { username: string; displayName?: string }) {
+        need("fediverse");
+        return api<{ account: any; token: string }>("POST", "/api/fedi/account", { username: opts.username, display_name: opts.displayName || "" });
+      },
+      async token() {
+        need("fediverse");
+        const r = await api<{ token: string; url: string }>("POST", "/api/fedi/token");
+        return { ...r, api: new URL(`${API_BASE}/`, location.href).href.replace(/\/$/, "") };
+      },
+      async apps() {
+        need("fediverse");
+        return api<{ id: string; name: string; website: string | null; created: number; lastUsed: number | null; scopes: string[]; scute: boolean; push: boolean }[]>("GET", "/api/fedi/apps");
+      },
+      async revokeApp(id: string) {
+        need("fediverse");
+        await api("DELETE", `/api/fedi/apps/${encodeURIComponent(id)}`);
+      },
+      async deleteAccount(confirm: string) {
+        need("fediverse");
+        await api("POST", "/api/fedi/account/delete", { confirm });
+      },
+    },
     storage: {
       get(key: string) {
         need("storage");

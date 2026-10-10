@@ -305,7 +305,7 @@ export function registerDriveRoutes(
 
   if (TRASH_DAYS) {
     void purgeTrash();
-    setInterval(() => void purgeTrash(), 6 * 3600_000).unref();
+    setInterval(() => purgeTrash().catch((e) => console.error("[drive] trash", e)), 6 * 3600_000).unref();
   }
 
   // ---------------------------------------------------------------- JSON API for the plug-in

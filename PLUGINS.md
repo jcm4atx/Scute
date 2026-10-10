@@ -96,7 +96,7 @@ Type definitions for editors live in [`plugins/scute-plugin.d.ts`](plugins/scute
 | `permissions` | no | See below |
 | `shareViewer` | no | API 6: a `.html` file inside the folder that `/shared/<name>/` serves for this plug-in's shares. It must be self-contained (inline its scripts and styles); it's served with a strict CSP that allows only same-origin fetches and OpenStreetMap tiles. |
 | `shareAllow` | no | API 7: loosen the viewer's CSP for public (unencrypted) sites. Any of `web-images` (images from https: addresses), `web-media` (video and audio from https:), `video-embeds` (YouTube-nocookie and Vimeo players in iframes). |
-| `apiVersion` | no | Default `1`. Scute 1.7.0 offers `2`, Scute 1.8.0 offers `3`, Scute 1.10.0 offers `4`, Scute 1.11.0 offers `5`, Scute 1.12.0 offers `6`, Scute 1.15.0 offers `7`, Scute 1.16.0 offers `8`. Plug-ins asking for a newer API than the server offers are refused. |
+| `apiVersion` | no | Default `1`. Scute 1.7.0 offers `2`, Scute 1.8.0 offers `3`, Scute 1.10.0 offers `4`, Scute 1.11.0 offers `5`, Scute 1.12.0 offers `6`, Scute 1.15.0 offers `7`, Scute 1.16.0 offers `8`, Scute 1.19.0 offers `9`. Plug-ins asking for a newer API than the server offers are refused. |
 
 A plug-in can have extra files (images, more modules); they're served from `/plugins/<id>/<path>` and can be imported with relative `import` statements.
 
@@ -110,7 +110,9 @@ A plug-in can have extra files (images, more modules); they're served from `/plu
 | `storage` | `storage.*`: a small per-user, per-plug-in key/value store, encrypted and synced with your settings (64 KB per plug-in) |
 | `network` | The plug-in talks to other websites. Needed for `scute.net.fetch` (API 3, the relay) and `scute.net.get` (API 4, public web). Plain browser `fetch` isn't blocked, but declare it honestly either way; it's shown to the admin. |
 | `publish` | API 6: `shares.*`, publishing read-only pages at `/shared/<name>/` that anyone with the address can load. Encrypt what you upload. |
+| `inbox` | API 9: `inbox.*`, addresses other apps (such as OwnTracks) send data to, and what they've sent |
 | `drive` | API 8: `drive.*`, the user's Scute Drive files (ordinary, unencrypted files on the server, also reachable over WebDAV) and its app passwords |
+| `fediverse` | API 10: `fedi.*`, the user's Fediverse account and a Mastodon-API token that can read and post as them |
 
 A call without the permission throws an error, which Scute shows as a toast.
 
@@ -324,6 +326,38 @@ await scute.drive.tokens.list(); await scute.drive.tokens.remove(id)
 
 Errors carry `status` (404, 405, 409, 413 too big, 507 out of space). The Scute Drive plug-in in scute-extras is the complete example.
 
+### Inbox (API 9, `inbox`)
+
+Web addresses other apps can send data to without signing in, such as a phone app sending its location. Each address belongs to the plug-in that made it. The server seals every request to the user's public key when it arrives and keeps it until a plug-in in the browser fetches it; `fetch()` opens the seal with the user's private key, so the plug-in gets the request as it was sent. Store what you need in notes, then `ack()` the items so the server deletes them.
+
+```js
+const info = await scute.inbox.info()     // { enabled, maxKb, base, endpoints: [{ id, label, url, created, lastUsed, received, waiting }] }
+const a = await scute.inbox.create({ label: "OwnTracks · Phone" })   // { ...endpoint, secret }: the password, shown only now
+await scute.inbox.update(a.id, { label, newSecret: true })          // newSecret: returns a new `secret`
+await scute.inbox.remove(a.id)            // also drops what's waiting
+const { items, more } = await scute.inbox.fetch({ limit: 500, after: 0 })
+// items: [{ id, endpoint, received, method, contentType, query, headers, body, base64 }] (oldest first), or { id, endpoint, received, error }
+await scute.inbox.ack(items.map((i) => i.id))
+```
+
+Apps send to `url` (or `url + "/" + secret`) with any method; the password can also come as a Basic-auth password, `Authorization: Bearer`, or `?token=`. `headers` keeps only `user-agent` and OwnTracks' `x-limit-u` / `x-limit-d`; `body` is text unless `base64` is true. Several browser tabs may run the plug-in at once, so fetch under `navigator.locks` (the Location history plug-in in scute-extras is the complete example).
+
+### Fediverse (API 10, `fediverse`)
+
+When the server has a Fediverse domain (`SCUTE_FEDI_DOMAIN`), each user can have one ActivityPub account, `@name@domain`. Plug-ins manage it through `scute.fedi` and then talk to Scute's **Mastodon client API** like any Mastodon app would, with a token for this device.
+
+```js
+const info = await scute.fedi.info()   // { enabled, domain, url, allowed, version, account: <Mastodon Account> | null, queue: { waiting, retrying, lastError }, api }
+await scute.fedi.createAccount({ username: "jcm", displayName: "John" })  // { account, token }
+const { token, api } = await scute.fedi.token()   // a Bearer token for this signed-in device (replaces its previous one)
+const home = await fetch(`${api}/api/v1/timelines/home`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json())
+await scute.fedi.apps()                // Mastodon apps signed in to the account: [{ id, name, website, created, lastUsed, scopes, scute, push }]
+await scute.fedi.revokeApp(id)
+await scute.fedi.deleteAccount("jcm")  // the account name, to confirm
+```
+
+`api` is Scute's own address (e.g. `https://example.com/scute`), so requests are same-origin; the streaming API is a WebSocket at `${api}/api/v1/streaming?stream=user&access_token=…`. Everything in the Fediverse is stored in plain form on the server; don't post the contents of encrypted notes unless the user asks. The Fediverse plug-in in scute-extras is the complete example.
+
 ### Storage (`storage`)
 
 ```js
@@ -397,7 +431,7 @@ scute.ui.el("div", { class: "x", onclick: fn, style: {...} }, "text", childEl, [
 
 ### Info
 
-`scute.version` (Scute version), `scute.apiVersion` (`2` in Scute 1.7.0, `3` in 1.8.0, `4` in 1.10.0, `5` in 1.11.0, `6` in 1.12.0, `7` in 1.15.0, `8` in 1.16.0), `scute.plugin` (`{ id, name, version, permissions }`).
+`scute.version` (Scute version), `scute.apiVersion` (`2` in Scute 1.7.0, `3` in 1.8.0, `4` in 1.10.0, `5` in 1.11.0, `6` in 1.12.0, `7` in 1.15.0, `8` in 1.16.0, `9` in 1.19.0, `10` in 1.20.0), `scute.plugin` (`{ id, name, version, permissions }`).
 
 ## Development tips
 

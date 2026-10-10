@@ -216,6 +216,7 @@ export default function Home() {
     openView: (pluginId, viewId) => {
       setPview({ pluginId, viewId });
       setNavOpen(false);
+      setEditor(null); // a note action that opens a view (Share to Fediverse) shouldn't leave the note on top
     },
     openSpace: (spaceId, tab) => {
       // No membership check here: a space a plug-in just created may not be in

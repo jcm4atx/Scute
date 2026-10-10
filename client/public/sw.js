@@ -1,6 +1,6 @@
 /* Scute service worker: offline app shell. API traffic is never cached here;
    the app keeps its own encrypted cache in IndexedDB. */
-const VERSION = "scute-1.17.0";
+const VERSION = "scute-1.20.2";
 const SHELL = ["./", "./index.html", "./manifest.webmanifest", "./icon.svg", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", (e) => {

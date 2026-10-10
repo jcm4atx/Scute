@@ -286,6 +286,14 @@ export function DecryptedImage({ note, className, alt }: { note: Note; className
   return <img src={url} alt={alt} className={className} />;
 }
 
+/** What went wrong fetching an attachment, in words: only a real decryption failure says "decrypt". */
+export function fileError(e: any): string {
+  if (!navigator.onLine) return "Not available offline";
+  if (e?.name === "NetworkError") return "Couldn't reach your server. Try again in a moment.";
+  if (typeof e?.status === "number") return e.status === 404 ? "This file isn't on the server" : `The server couldn't send this file (error ${e.status})`;
+  return "Couldn't decrypt this file";
+}
+
 /** Downloads + decrypts an attachment with progress, returning a blob URL. */
 function useDecryptedUrl(note: Note, enabled = true) {
   const v = useVault();
@@ -301,7 +309,7 @@ function useDecryptedUrl(note: Note, enabled = true) {
     if (!enabled || !note.fileSize) return;
     v.getFileUrl(note, (f) => live && setProgress(f))
       .then((u) => live && setUrl(u))
-      .catch((e) => live && setErr(e?.name === "NetworkError" || !navigator.onLine ? "Not available offline" : "Couldn't decrypt this file"));
+      .catch((e) => live && setErr(fileError(e)));
     return () => {
       live = false;
     };

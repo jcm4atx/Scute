@@ -79,6 +79,25 @@ export interface ArchiveInfo {
   title?: string;
   resources?: number; // images, styles and fonts inlined into a page copy
   skipped?: number;
+  /** How it was saved (1.18.0): a page copy, the linked file, a photo page's picture, or a video via yt-dlp. */
+  via?: "page" | "file" | "image" | "yt-dlp";
+  duration?: number; // seconds, videos
+  uploader?: string;
+  site?: string;
+  /** Shared as a read-only page at /shared/<slug>/ (1.18.0). The key stays in the (encrypted) note. */
+  share?: SavedShare | null;
+}
+
+export interface SavedShare {
+  slug: string;
+  mode: "link" | "password";
+  key: string; // content key (base64url); in the link for "link" shares
+  wrap?: { salt: string; iter: number; sealed: string }; // the key under the password, for "password" shares
+  at: number; // when it was published
+  copyAt: number; // archive.at of the copy that was published
+  expires?: number | null;
+  source: boolean; // shows where it came from
+  download: boolean;
 }
 
 export interface NoteData {

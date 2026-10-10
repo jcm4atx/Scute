@@ -1,6 +1,6 @@
 {
   "name": "scute",
-  "version": "1.17.0",
+  "version": "1.20.2",
   "license": "MIT",
   "type": "module",
   "scripts": {

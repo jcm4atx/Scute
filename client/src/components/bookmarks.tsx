@@ -1,14 +1,16 @@
 // Bookmark extras: previews on cards, saved copies (ArchiveBox-style), duplicate detection.
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { AlertTriangle, Archive, Copy as CopyIcon, Download, Eye, Film, Image as ImageIcon, Loader2, Play, RefreshCw, Trash2, X } from "lucide-react";
+import { AlertTriangle, Archive, ChevronDown, Copy as CopyIcon, Download, Eye, FileText, Film, Globe, Image as ImageIcon, Loader2, Play, RefreshCw, Share2, Trash2, X } from "lucide-react";
 import type { NoteData } from "@shared/schema";
 import { canWrite, useVault, type Note } from "@/lib/vault";
 import { toast } from "@/hooks/use-toast";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { embedFor } from "@/lib/media";
-import { archiveLink, buildPreview, canArchive, guessKind, urlKey, webEnabled, type LinkKind } from "@/lib/web";
+import { embedFor, makeVideoPoster } from "@/lib/media";
+import { archiveLink, buildPreview, canArchive, guessKind, hostedVideo, mediaEnabled, serverFeatures, urlKey, webEnabled, type ArchiveAs, type LinkKind } from "@/lib/web";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { ShareCopyDialog } from "@/components/share-copy";
 import { DecryptedImage, EmbedPlayer, VideoPlayer, AudioPlayer, fmtBytes, hostOf } from "@/components/note-parts";
 
 type Vault = ReturnType<typeof useVault>;
@@ -80,32 +82,57 @@ async function runPreview(id: string, opts: { fillTitle?: boolean } = {}) {
 }
 
 /** Save a copy of what the bookmark points to as the note's (encrypted) attachment. */
-async function runArchive(id: string, quiet = false) {
+async function runArchive(id: string, quiet = false, as: ArchiveAs = "auto") {
   const n = await fresh(id);
   if (!n?.data.url) return false;
   const host = hostOf(n.data.url);
   setJob(id, { kind: "archive", msg: "Saving a copy…" });
   try {
     const max = (await maxUpload()) * 1024 * 1024;
-    const a = await archiveLink(n.data.url, { maxBytes: max, onProgress: (msg) => setJob(id, { kind: "archive", msg }) });
+    const a = await archiveLink(n.data.url, { maxBytes: max, as, hint: n.data.preview, onProgress: (msg) => setJob(id, { kind: "archive", msg }) });
     if (a.file.size > max) throw new Error(`The copy is ${fmtBytes(a.file.size)}, over this server's upload limit`);
+    // a picture for the card if the bookmark has none yet: the video's first frames or the image itself
+    let thumb: string | null = null;
+    let duration = a.duration;
+    if (!n.data.thumb && a.kind === "video") {
+      setJob(id, { kind: "archive", msg: "Making a thumbnail…" });
+      const pv = await makeVideoPoster(a.file).catch(() => null);
+      thumb = pv?.thumb || null;
+      duration ||= pv?.duration;
+    } else if (!n.data.thumb && a.kind === "image") thumb = await imageThumb(a.file).catch(() => null);
     setJob(id, { kind: "archive", msg: "Encrypting and uploading…" });
     await patch(
       id,
       (d) => ({
         ...d,
         title: d.title || a.title || "",
-        file: { name: a.file.name, type: a.file.type, size: a.file.size },
+        thumb: d.thumb || thumb,
+        file: { name: a.file.name, type: a.file.type, size: a.file.size, width: a.width, height: a.height, duration },
         joplin: d.joplin ? { ...d.joplin, resId: undefined } : d.joplin, // re-send the new copy
-        archive: { at: Date.now(), url: a.url, kind: a.kind, title: a.title, resources: a.resources, skipped: a.skipped },
-        preview: d.preview ? { ...d.preview, kind: a.kind === "file" ? d.preview.kind : a.kind } : d.preview,
+        archive: {
+          at: Date.now(),
+          url: a.url,
+          kind: a.kind,
+          title: a.title,
+          resources: a.resources,
+          skipped: a.skipped,
+          via: a.via,
+          duration,
+          uploader: a.uploader,
+          site: a.site,
+          share: d.archive?.share || null,
+        },
+        preview: d.preview
+          ? { ...d.preview, kind: a.kind === "file" || a.fallback ? d.preview.kind : a.kind, description: d.preview.description || a.description?.slice(0, 500) }
+          : { kind: a.kind === "file" ? "page" : a.kind, site: a.site, description: a.description?.slice(0, 500), checked: Date.now() },
       }),
       a.file,
     );
-    if (!quiet)
+    if (a.fallback) toast({ title: "Saved the page instead", description: a.fallback });
+    else if (!quiet)
       toast({
-        title: "Copy saved",
-        description: `${host} · ${fmtBytes(a.file.size)}${a.kind === "page" ? ` · ${a.resources} image${a.resources === 1 ? "" : "s"}/styles included${a.skipped ? `, ${a.skipped} couldn't be saved` : ""}` : ""}`,
+        title: a.via === "yt-dlp" ? (a.kind === "audio" ? "Audio saved" : "Video saved") : a.via === "image" ? "Picture saved" : "Copy saved",
+        description: `${host} · ${fmtBytes(a.file.size)}${a.height && a.kind === "video" ? ` · ${a.height}p` : ""}${a.kind === "page" ? ` · ${a.resources} image${a.resources === 1 ? "" : "s"}/styles included${a.skipped ? `, ${a.skipped} couldn't be saved` : ""}` : ""}`,
       });
     return true;
   } catch (e) {
@@ -114,6 +141,18 @@ async function runArchive(id: string, quiet = false) {
   } finally {
     setJob(id, null);
   }
+}
+
+/** A small JPEG data URL for an image file (the card picture). */
+async function imageThumb(file: Blob, size = 480): Promise<string | null> {
+  const b = await createImageBitmap(file);
+  const r = Math.min(1, size / Math.max(b.width, b.height));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(b.width * r));
+  c.height = Math.max(1, Math.round(b.height * r));
+  c.getContext("2d")!.drawImage(b, 0, 0, c.width, c.height);
+  b.close();
+  return c.toDataURL("image/jpeg", 0.8);
 }
 
 let maxMb: number | null = null;
@@ -135,11 +174,11 @@ export function afterBookmarkSave(id: string, opts: { preview: boolean; archive:
     if (!(await webEnabled())) return;
     if (opts.preview) await runPreview(id);
     const n = await fresh(id);
-    if (opts.archive && canArchive(n?.data.url)) await runArchive(id);
+    if (opts.archive && canArchive(n?.data.url, await mediaEnabled())) await runArchive(id);
   });
 }
-export function archiveBookmark(id: string, quiet = false) {
-  return enqueue(async () => ((await webEnabled()) ? runArchive(id, quiet) : false));
+export function archiveBookmark(id: string, quiet = false, as: ArchiveAs = "auto") {
+  return enqueue(async () => ((await webEnabled()) ? runArchive(id, quiet, as) : false));
 }
 export function refreshPreview(id: string) {
   return enqueue(() => runPreview(id, { fillTitle: false }));
@@ -246,7 +285,11 @@ export function BookmarkView({ noteId, writable }: { noteId: string; writable: b
   const note = v.notes.find((n) => n.id === noteId);
   const job = useBookmarkJob(noteId);
   const [viewing, setViewing] = useState(false);
+  const [sharing, setSharing] = useState(false);
   const [fullErr, setFullErr] = useState(false);
+  const feats = useServerFeatures();
+  const mediaOn = feats.includes("media-download");
+  const sharesOn = feats.includes("shares");
   if (!note) return null;
   const d = note.data;
   const kind = bookmarkKind(d);
@@ -294,16 +337,19 @@ export function BookmarkView({ noteId, writable }: { noteId: string; writable: b
             <>
               <span className="font-medium">Saved copy</span>
               <span className="block text-xs text-muted-foreground" data-testid="text-archive-info">
-                {new Date(a.at).toLocaleString()} · {fmtBytes(d.file?.size || note.fileSize)}
+                {copyLabel(a, d)} · {new Date(a.at).toLocaleString()} · {fmtBytes(d.file?.size || note.fileSize)}
+                {a.duration ? ` · ${fmtDuration(a.duration)}` : ""}
+                {a.kind === "video" && d.file?.height ? ` · ${d.file.height}p` : ""}
                 {a.kind === "page" && a.skipped ? ` · ${a.skipped} item${a.skipped > 1 ? "s" : ""} missing` : ""}
+                {a.share ? " · shared" : ""}
               </span>
             </>
           ) : (
             <span className="text-muted-foreground">
-              {embed && embed.kind !== "direct" ? (
+              {embed && embed.kind !== "direct" && !mediaOn ? (
                 <>
                   Not saved offline
-                  <span className="block text-xs">Scute keeps the title and thumbnail; the video itself stays on {embed.label}.</span>
+                  <span className="block text-xs">Scute keeps the title and thumbnail; the video itself stays on {embed.label}. (This server can't download videos.)</span>
                 </>
               ) : (
                 "No saved copy yet."
@@ -321,13 +367,106 @@ export function BookmarkView({ noteId, writable }: { noteId: string; writable: b
             <Download className="h-3.5 w-3.5" /> Download
           </Button>
         )}
-        {writable && !job && canArchive(d.url) && (
-          <Button size="sm" variant={a ? "ghost" : "secondary"} disabled={!v.online} onClick={() => void archiveBookmark(noteId)} data-testid="button-save-copy">
-            {a ? <RefreshCw className="h-3.5 w-3.5" /> : <Archive className="h-3.5 w-3.5" />} {a ? "Save again" : "Save a copy"}
+        {a && writable && sharesOn && (
+          <Button size="sm" variant={a.share ? "secondary" : "ghost"} disabled={!v.online} onClick={() => setSharing(true)} data-testid="button-share-copy">
+            <Share2 className="h-3.5 w-3.5" /> {a.share ? "Shared" : "Share"}
           </Button>
+        )}
+        {writable && !job && canArchive(d.url, mediaOn) && (
+          <SaveCopyButton
+            noteId={noteId}
+            again={!!a}
+            disabled={!v.online}
+            options={saveOptions(d, mediaOn)}
+          />
         )}
       </div>
       {viewing && a && <ArchiveViewer note={note} onClose={() => setViewing(false)} />}
+      {sharing && a && <ShareCopyDialog note={note} onClose={() => setSharing(false)} />}
+    </div>
+  );
+}
+
+/** The server's optional features (from /api/health). */
+export function useServerFeatures() {
+  const [f, setF] = useState<string[]>([]);
+  useEffect(() => {
+    let on = true;
+    void serverFeatures().then((x) => on && setF(x));
+    return () => {
+      on = false;
+    };
+  }, []);
+  return f;
+}
+
+function fmtDuration(s: number) {
+  s = Math.round(s);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const x = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${x}` : `${m}:${x}`;
+}
+
+function copyLabel(a: NonNullable<NoteData["archive"]>, d: NoteData) {
+  if (a.via === "yt-dlp") return a.kind === "audio" ? "Audio" : "Video";
+  if (a.via === "image") return "Picture";
+  if (a.kind === "page") return d.file?.type.startsWith("text/plain") ? "Text" : "Page";
+  return a.kind === "image" ? "Image" : a.kind === "video" ? "Video" : a.kind === "audio" ? "Audio" : "File";
+}
+
+/** What a bookmark could be saved as, besides "whatever fits" (auto). */
+function saveOptions(d: NoteData, mediaOn: boolean): ArchiveAs[] {
+  const url = d.url || "";
+  const direct = !hostedVideo(url) && !!guessKind(url);
+  if (direct) return []; // a file link: there's only one thing to save
+  const out: ArchiveAs[] = [];
+  if (!hostedVideo(url)) out.push("page");
+  if (d.preview?.image || d.preview?.kind === "image") out.push("image");
+  if (mediaOn) out.push("video");
+  return out.length > 1 ? out : [];
+}
+
+const AS_LABEL: Record<ArchiveAs, { label: string; hint: string; icon: typeof Globe }> = {
+  auto: { label: "Whatever fits", hint: "", icon: Archive },
+  page: { label: "The page", hint: "A self-contained copy of the page", icon: FileText },
+  image: { label: "The picture", hint: "The page's main picture, full size", icon: ImageIcon },
+  video: { label: "The video", hint: "Downloaded by the server with yt-dlp", icon: Film },
+};
+
+function SaveCopyButton({ noteId, again, disabled, options }: { noteId: string; again: boolean; disabled: boolean; options: ArchiveAs[] }) {
+  const main = (
+    <Button size="sm" variant={again ? "ghost" : "secondary"} disabled={disabled} onClick={() => void archiveBookmark(noteId)} className={options.length ? "rounded-r-none" : ""} data-testid="button-save-copy">
+      {again ? <RefreshCw className="h-3.5 w-3.5" /> : <Archive className="h-3.5 w-3.5" />} {again ? "Save again" : "Save a copy"}
+    </Button>
+  );
+  if (!options.length) return main;
+  return (
+    <div className="inline-flex">
+      {main}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button size="sm" variant={again ? "ghost" : "secondary"} disabled={disabled} className="rounded-l-none border-l border-background/40 px-1.5" aria-label="Save as…" data-testid="button-save-copy-as">
+            <ChevronDown className="h-3.5 w-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-60">
+          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">Save a copy of…</DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          {options.map((o) => {
+            const I = AS_LABEL[o].icon;
+            return (
+              <DropdownMenuItem key={o} onSelect={() => void archiveBookmark(noteId, false, o)} data-testid={`menu-save-as-${o}`}>
+                <I className="h-4 w-4" />
+                <div>
+                  <div>{AS_LABEL[o].label}</div>
+                  <div className="text-xs text-muted-foreground">{AS_LABEL[o].hint}</div>
+                </div>
+              </DropdownMenuItem>
+            );
+          })}
+        </DropdownMenuContent>
+      </DropdownMenu>
     </div>
   );
 }

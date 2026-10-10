@@ -113,6 +113,8 @@ const PERM_TEXT: Record<string, string> = {
   network: "Talk to other websites",
   publish: "Publish pages at /shared/",
   drive: "Use your Scute Drive files",
+  inbox: "Receive data other apps send to Scute (e.g. your location)",
+  fediverse: "Use your Fediverse account: read and post as you, follow people",
 };
 
 /** Settings → Plug-ins tab. */

@@ -55,6 +55,8 @@ export function embedFor(raw?: string | null): Embed | null {
     }
   }
 
+  // wiki pages about a file (Wikimedia Commons "File:…webm") are pages, not the file
+  if (/\/wiki\/[^/]+:/.test(u.pathname)) return null;
   if (VIDEO_EXT.test(u.pathname)) return { kind: "direct", media: "video", src: u.href, label: u.hostname };
   if (AUDIO_EXT.test(u.pathname)) return { kind: "direct", media: "audio", src: u.href, label: u.hostname };
   return null;

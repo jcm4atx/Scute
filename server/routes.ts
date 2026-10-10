@@ -20,6 +20,9 @@ import { NET_ON, PLUGINS_ON, registerPluginRoutes } from "./plugins";
 import { WEB_ON, registerWebRoutes } from "./web";
 import { SHARES_ON, registerShareRoutes, removeUserShares } from "./shares";
 import { registerDriveRoutes, removeUserDrive } from "./drive";
+import { initMedia, mediaOn, registerMediaRoutes } from "./media";
+import { INBOX_ON, registerInboxRoutes } from "./inbox";
+import { FEDI_ON, registerFediRoutes, removeUserFedi } from "./fedi";
 
 const VERSION = APP_VERSION;
 const REGISTRATION = (process.env.SCUTE_REGISTRATION || "open").toLowerCase(); // open | closed
@@ -177,6 +180,20 @@ function throttle(key: string) {
   } else attempts.set(key, { n: 1, t: now });
 }
 
+/** Sign-in check for pages outside the web app (the Fediverse's OAuth page). Throws on failure. */
+export function checkLogin(username: string, authKey: string, ip: string): UserRow {
+  throttle(`${ip}|${username.toLowerCase()}`);
+  const u = db.prepare("SELECT * FROM users WHERE username = ?").get(username) as UserRow | undefined;
+  if (!u || !safeEq(hashAuth(authKey, u.auth_salt), u.auth_hash)) throw new HttpError(401, "Wrong username or password");
+  attempts.delete(`${ip}|${username.toLowerCase()}`);
+  return u;
+}
+export function kdfParams(username: string) {
+  const u = db.prepare("SELECT kdf_salt, kdf_iter FROM users WHERE username = ?").get(username) as { kdf_salt: string; kdf_iter: number } | undefined;
+  if (u) return { salt: u.kdf_salt, iter: u.kdf_iter };
+  return { salt: crypto.createHmac("sha256", SECRET).update(username.toLowerCase()).digest("base64"), iter: 600000 };
+}
+
 // ---------- routes ----------
 export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
   app.get("/api/health", (_req, res) => {
@@ -187,7 +204,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       version: VERSION,
       registration: users === 0 ? "open" : REGISTRATION,
       maxUploadMb: MAX_UPLOAD_MB,
-      features: ["video", "multi-upload", "slideshow", "video-thumbnails", "default-space", ...(JOPLIN ? ["joplin"] : []), ...(PLUGINS_ON ? ["plugins"] : []), ...(NET_ON ? ["plugin-net"] : []), ...(WEB_ON ? ["web-archive", "bookmark-previews"] : []), ...(SHARES_ON ? ["shares"] : [])],
+      features: ["video", "multi-upload", "slideshow", "video-thumbnails", "default-space", ...(JOPLIN ? ["joplin"] : []), ...(PLUGINS_ON ? ["plugins"] : []), ...(NET_ON ? ["plugin-net"] : []), ...(WEB_ON ? ["web-archive", "bookmark-previews"] : []), ...(mediaOn() ? ["media-download"] : []), ...(SHARES_ON ? ["shares"] : []), ...(INBOX_ON ? ["inbox"] : []), ...(FEDI_ON ? ["fediverse"] : [])],
       hasUsers: users > 0,
     });
   });
@@ -371,6 +388,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const owned = db.prepare("SELECT id FROM spaces WHERE owner_id = ?").all(u.id) as { id: string }[];
       removeUserShares(u.id);
       removeUserDrive(u);
+      removeUserFedi(u.id);
       const tx = db.transaction(() => {
         for (const s of owned) {
           const notes = db.prepare("SELECT id FROM notes WHERE space_id = ? AND file_size IS NOT NULL").all(s.id) as {
@@ -760,8 +778,12 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   // ---------- plug-ins ----------
   registerPluginRoutes(app, { auth, wrap, HttpError });
   registerWebRoutes(app, { auth, wrap, HttpError } as any);
+  initMedia();
+  registerMediaRoutes(app, { auth, wrap, HttpError } as any);
   registerShareRoutes(app, { auth, wrap, HttpError } as any);
   registerDriveRoutes(app, { auth, wrap, HttpError, sessionUser } as any);
+  registerInboxRoutes(app, { auth, wrap, HttpError } as any);
+  registerFediRoutes(app, httpServer, { auth, wrap, HttpError, checkLogin, kdfParams } as any);
 
   // JSON errors for the API
   app.use("/api", (err: any, _req: Request, res: Response, next: NextFunction) => {

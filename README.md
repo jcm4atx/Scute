@@ -9,7 +9,7 @@ A self-hosted, end-to-end encrypted home for notes, bookmarks, passwords, images
 - **Six note types**: Markdown notes (with checklists, tables, code), bookmarks, passwords (with generator and copy buttons), images (encrypted thumbnails + full-size), videos, and file attachments.
 - **Built-in video and audio player**: upload a video and it's encrypted like everything else; Scute grabs a poster frame and duration in the browser and plays it inline (decrypted in memory, with seek, fullscreen and picture-in-picture). Audio and video files attached as plain files play too. Bookmarks pointing at YouTube (via youtube-nocookie.com), Vimeo, or a direct `.mp4`/`.webm`/`.mp3` link play inside Scute; nothing is loaded from the third party until you press play.
 - **Bulk upload**: pick or drop several files at once (New → Upload files, drag onto the note grid, or drop more onto a file note) and each becomes its own encrypted note, auto-typed as image, video or file. Shared notes, tags, board and color apply to all of them; failed uploads stay listed for a retry.
-- **Bookmarks with previews and saved copies**: bookmarks show the page's title, description and picture, image links display the image, and video links show a thumbnail. Scute can keep an encrypted, self-contained copy of the page (in the spirit of ArchiveBox) so it stays readable if the site changes or disappears, and it warns you about duplicate bookmarks.
+- **Bookmarks with previews and saved copies**: bookmarks show the page's title, description and picture, image links display the image, and video links show a thumbnail. Scute can keep an encrypted copy (in the spirit of ArchiveBox): a self-contained snapshot of the page, the full-size picture of a photo page, or the video itself from YouTube, Vimeo and other video sites (downloaded by the server with yt-dlp), so it stays available if the site changes or disappears. Saved copies can be shared as a read-only page with a secret link or a password. It also warns you about duplicate bookmarks.
 - **Spaces and boards**: spaces separate collections (Personal, Work, Family); boards group notes inside a space. Tags, type filters, full-text search (runs locally on decrypted data), sort, pinning and colors.
 - **Moving many notes at once**: select notes (or Ctrl+click, Shift+click for a range) and move them to another board or space, or drag them onto a board.
 - **Hidden spaces**: keep sensitive spaces out of sight on your devices, optionally behind your password or a PIN.
@@ -17,6 +17,8 @@ A self-hosted, end-to-end encrypted home for notes, bookmarks, passwords, images
 - **Offline-first PWA**: installable on desktop and mobile, service-worker app shell, encrypted local cache, and an outbox that syncs changes when you're back online. Share target: share a link from your phone straight into Scute.
 - **Joplin Server sync**: a space can be linked to a self-hosted Joplin Server account and stay in two-way sync with the Joplin desktop and mobile apps (notebooks, notes, tags, to-dos, images and attachments).
 - **Scute Drive**: a private cloud folder of ordinary files on your server, synced two ways with Linux (rclone) and Android over WebDAV, with a web file browser, trash and per-device app passwords (with the Scute Drive plug-in).
+- **Inbox for other apps**: phone apps such as OwnTracks can send your location (or other data) to a private address; Scute seals it with your key as it arrives and the Location history plug-in turns it into encrypted notes and a travel dashboard.
+- **Fediverse server**: your own Mastodon-compatible account (`@you@your.domain`) served by Scute. Follow and be followed from Mastodon, Pixelfed, Misskey and the rest, share posts and any kind of file, and use Mastodon apps such as Tusky, Ivory, Elk or Phanpy (with the Fediverse plug-in).
 - **Plug-ins**: add your own commands, note buttons, views, templates and Markdown syntax with small JavaScript plug-ins. Four examples are included (daily note, wiki links, word count, space stats).
 - **Import/export**: decrypted JSON export (with or without attachments), import of Scute exports and best-effort import of Turtl JSON backups.
 - **Tiny footprint**: one Node.js process and one SQLite file. No Postgres, no Redis.
@@ -121,11 +123,24 @@ Scute captures a poster frame when a video is uploaded. Videos that don't have o
 
 When you paste a URL into a new bookmark, Scute looks it up and fills in the title, description and preview picture. Links to images show the image itself; links to videos show a thumbnail (YouTube and Vimeo via their public thumbnail services, direct `.mp4`/`.webm` links from a frame of the video).
 
-**Save a copy of the page** (on by default, remembered per device) stores a single-file snapshot of the page: stylesheets, fonts and images are pulled in and embedded, scripts are removed, and the result is encrypted in your browser like any other attachment. Links to an image, PDF or other file save the file itself. Open the bookmark to **View** the saved copy (it opens in a locked-down frame with no scripts), **Download** it as an `.html` file, or **Save again** to take a fresh snapshot. Copies of YouTube and Vimeo videos are not downloaded; Scute keeps their title and thumbnail.
+**Save a copy** (on by default, remembered per device) keeps what the bookmark points to, encrypted in your browser like any other attachment, in the spirit of a very small [ArchiveBox](https://archivebox.io/):
+
+| The bookmark is… | Scute saves |
+| --- | --- |
+| a video page (YouTube, Vimeo, PeerTube, Internet Archive, Wikimedia Commons, and the [thousands of sites yt-dlp knows](https://github.com/yt-dlp/yt-dlp/blob/master/supportedsites.md)) | the video, downloaded by the server with yt-dlp, up to `SCUTE_MEDIA_HEIGHT` (1080p) and preferring MP4 so every browser plays it; a smaller version is picked if the best one is over the upload limit |
+| a photo page (Flickr, Imgur, Unsplash, DeviantArt, Commons `File:` pages, or any page that says it's a photo) | the full-size picture |
+| an image, video, audio, PDF or other file | the file itself |
+| any other page | a single-file snapshot: stylesheets, fonts and images embedded, scripts removed |
+
+The arrow next to **Save a copy** / **Save again** lets you choose: the page, the picture, or the video. If a video can't be downloaded (some sites want a signed-in browser, or it's over the size limit), Scute saves the page instead and says why. Open the bookmark to watch or view the saved copy (pages open in a locked-down frame with no scripts), **Download** it, or **Save again** for a fresh one.
+
+Video downloads need `yt-dlp` (and `ffmpeg` to combine separate video and audio streams) on the server. The Docker image includes both and runs `yt-dlp -U` at start and once a day, since sites change often; on bare metal install them yourself (`pipx install yt-dlp`, `apt install ffmpeg`) or set `SCUTE_YTDLP` to the program. YouTube also needs a JavaScript runtime, and yt-dlp uses Scute's own Node.js for that. The server downloads into `<data>/tmp/media/`, hands the file to your browser, and deletes it; nothing unencrypted stays on the server. YouTube sometimes refuses servers in data centers ("Sign in to confirm you're not a bot"); from a home connection it normally works.
+
+**Share** on a saved copy publishes it as a read-only page at `/shared/<name>/` that anyone can open without an account: pages in the same locked-down frame, pictures full size, videos and audio in the browser's player, other files as a download. The copy is encrypted in your browser with a new key that is either part of the link (after the `#`, which browsers never send to the server) or behind a password, so the server only stores scrambled files. You choose the address, whether it stops working after a day, a week or 30 days, whether it shows where the copy came from, and whether visitors may download it. **Update shared copy** republishes after **Save again**; **Stop sharing** deletes it from the server. Shares of saved copies work with plug-ins on or off and follow the rules under [Published shares](#published-shares) (size limits, proxies, your own domain).
 
 If the URL is already bookmarked (ignoring `www.`, tracking parameters like `utm_*`, `#fragments`, and `youtu.be` vs `youtube.com/watch` forms), the editor warns you and offers to open the existing one. **Bookmark tools…** in the space menu lists all duplicates (in this space or across every space) so you can keep one and delete the rest, and can save missing copies or refresh previews for older bookmarks in bulk.
 
-The server fetches pages on your behalf (browsers can't read other sites directly), but it only sees the URL and the raw page; saved copies are encrypted before they're uploaded. By default it refuses private and local addresses (`localhost`, `10.x`, `192.168.x`, …) so it can't be used to probe your network; set `SCUTE_ARCHIVE_PRIVATE=on` if you want to bookmark things on your LAN. Pages that build themselves entirely with JavaScript may save imperfectly because scripts are stripped. Saved copies count against `SCUTE_MAX_UPLOAD_MB`.
+The server fetches pages on your behalf (browsers can't read other sites directly), but it only sees the URL and the raw page; saved copies are encrypted before they're uploaded. By default it refuses private and local addresses (`localhost`, `10.x`, `192.168.x`, …) so it can't be used to probe your network; set `SCUTE_ARCHIVE_PRIVATE=on` if you want to bookmark things on your LAN. Pages that build themselves entirely with JavaScript may save imperfectly because scripts are stripped. Saved copies count against `SCUTE_MAX_UPLOAD_MB`. yt-dlp only gets the address you bookmarked checked against private addresses; it follows the site's own links from there.
 
 ## Joplin Server sync
 
@@ -181,7 +196,7 @@ Writing one is a manifest and a JavaScript file; see [PLUGINS.md](PLUGINS.md) fo
 
 ## Published shares
 
-Since 1.12.0 a plug-in with the `publish` permission (such as the photo album) can put an encrypted, read-only web page at `https://notes.example.com/shared/<name>/` for people who don't have a Scute account. Everything is encrypted in your browser before it's uploaded; the page decrypts it in the visitor's browser with a password, or with a key that's only in the link after `#` (never sent to any server). The server stores unreadable `.bin` files, can let a share expire, and forgets it when you stop sharing. Pages are served with `noindex` and `no-referrer`.
+Since 1.18.0 Scute uses the same mechanism to share saved bookmark copies (see [Bookmarks](#bookmarks-previews-saved-copies-duplicates)), and since 1.12.0 a plug-in with the `publish` permission (such as the photo album) can put an encrypted, read-only web page at `https://notes.example.com/shared/<name>/` for people who don't have a Scute account. Everything is encrypted in your browser before it's uploaded; the page decrypts it in the visitor's browser with a password, or with a key that's only in the link after `#` (never sent to any server). The server stores unreadable `.bin` files, can let a share expire, and forgets it when you stop sharing. Pages are served with `noindex` and `no-referrer`.
 
 Since 1.15.0 a share can also be a public website with no password, such as a space published with the space website plug-in: its pages, images and videos are stored as ordinary files and anyone with the address can read them. The same own-address setup below works for both.
 
@@ -235,6 +250,44 @@ Things to know:
 - **Under a path** (`https://example.com/scute/`): also send the path, so the addresses in WebDAV answers are right. In the `<Location /scute/>` block add `RequestHeader set X-Forwarded-Prefix "/scute"` (`a2enmod headers`), or set `SCUTE_BASE_PATH=/scute`. Devices then use `https://example.com/scute/dav/`.
 - Wrong app passwords are slowed down per address and username after 20 tries in 15 minutes; set `SCUTE_TRUST_PROXY=1` behind a proxy so that's the real address. `SCUTE_DRIVE=off` turns the drive off (it's also off when plug-ins are off).
 
+## Inbox: data from other apps
+
+Since 1.19.0 other apps can send data to Scute, for example your phone sending its location with OwnTracks, Overland, GPSLogger or Traccar Client. Install the **Location history** plug-in (in scute-extras) to use it; the plug-in makes the addresses and shows how to set each app up.
+
+- Each address looks like `https://notes.example.com/in/<id>` and has its own password, which the app sends as an HTTP Basic-auth password (OwnTracks' username/password fields), a Bearer token, `?token=…`, or at the end of the address (`/in/<id>/<password>`). Wrong passwords get a 401.
+- Scute can't read your notes, so it can't add what arrives to them. Instead each request is **sealed to your public key as it arrives** (the same ECDH P-256 box that shares space keys) and kept in the database until Scute is open in a browser; the plug-in then opens it, stores it in encrypted notes and tells the server to forget it. Nothing readable is written to disk, but the server does see requests while they arrive (an app's payload encryption, such as OwnTracks', hides even that).
+- The reply is what the apps expect (`[]` for OwnTracks, `{"result":"ok"}` for Overland, `OK` otherwise). Requests are limited to `SCUTE_INBOX_MAX_KB` each and 600 a minute per address; when `SCUTE_INBOX_MAX_ITEMS` are waiting the server answers 429 until a browser picks them up, and apps keep them queued.
+- **Reverse proxy**: nothing extra; `/in/` is under the same address (`https://example.com/scute/in/<id>` under a path). Don't strip the `Authorization` header. `SCUTE_INBOX=off` turns it off (it's also off when plug-ins are off).
+
+## Fediverse
+
+Since 1.20.0 Scute can be a small Fediverse server, like a one-person Mastodon. With it on, a Scute user can make an account such as `@jcm@jcm.social` and follow (and be followed by) people on Mastodon, Pixelfed, Misskey, GoToSocial and anything else that speaks ActivityPub. Install the **Fediverse** plug-in (in scute-extras) for the web interface: timelines, notifications, threads, profiles, search, and a composer with content warnings, polls, visibility and attachments.
+
+- **Turn it on** with `SCUTE_FEDI_DOMAIN`, the domain in your handle, e.g. `SCUTE_FEDI_DOMAIN: "jcm.social"`. That domain must be served by Scute **at its root** (`https://jcm.social/`, not under a path), because other servers look for `https://jcm.social/.well-known/webfinger`, `/users/…`, `/inbox` and so on. Point its DNS at your server, get a certificate, and proxy the whole site to Scute with the original `Host` header kept (Apache `ProxyPreserveHost On`, nginx `proxy_set_header Host $host`), plus WebSocket upgrades for `/api/v1/streaming`. The notes app stays where it is (for example `https://example.com/scute/`); on the Fediverse domain Scute only answers Fediverse addresses, and `/` goes to the first account's profile.
+- Apache, for a separate domain:
+
+  ```apache
+  <VirtualHost *:443>
+      ServerName jcm.social
+      # SSL lines (certbot) …
+      ProxyPreserveHost On
+      RequestHeader set X-Forwarded-Proto "https"
+      ProxyPass        /api/v1/streaming http://127.0.0.1:5000/api/v1/streaming upgrade=websocket
+      ProxyPass        / http://127.0.0.1:5000/ retry=0 timeout=600
+      ProxyPassReverse / http://127.0.0.1:5000/
+      LimitRequestBody 0
+  </VirtualHost>
+  ```
+
+  The site serving the notes app needs `upgrade=websocket` on its `ProxyPass` too, for live timelines in the plug-in (Apache 2.4.47+; `a2enmod proxy_wstunnel` on older versions). nginx: `proxy_http_version 1.1; proxy_set_header Upgrade $http_upgrade; proxy_set_header Connection "upgrade";`.
+- **Accounts**: each Scute user may make one Fediverse account (any name of letters, digits and `_`), in the plug-in. `SCUTE_FEDI_USERS` limits who may (comma-separated Scute usernames). Deleting it tells other servers, removes its posts and media, and retires the name for good.
+- **Plain, not encrypted**: the Fediverse is public by nature, so posts, profiles, follows, notifications and media are stored as they are, in the `fedi_*` tables of `scute.db` and in `$SCUTE_DATA_DIR/fedi/media/`. Nothing from your encrypted notes is shared unless you post it (the plug-in's "Share to Fediverse" note button copies a note's text and file into a new post). Direct messages work as on Mastodon: only the people mentioned see them, but they aren't end-to-end encrypted.
+- **Files**: posts can carry up to 4 attachments of any kind up to `SCUTE_FEDI_MAX_MB` each. Pictures, videos and audio show inline everywhere; other files (PDFs, zips, documents…) are sent as documents, which Mastodon and most apps show as a download link. Video posters are made with ffmpeg (in the Docker image). Media from other servers isn't copied; it's shown from where it lives.
+- **Mastodon apps**: Scute implements the Mastodon client API (`/api/v1`, `/api/v2`, OAuth, streaming and Web Push), so Tusky, Ivory, Ice Cubes, Mona, Elk, Phanpy and others work. Enter your Fediverse domain as the server and sign in with your **Scute** username and password; the sign-in page checks the password in your browser, the same way the Scute app does, so it never reaches the server. The plug-in lists connected apps and can sign them out.
+- What's there: following (with approval if you lock your account), posts with mentions, hashtags, links, content warnings, polls, edits, replies, boosts, favourites, bookmarks, pins, blocks and mutes, profile fields and pictures, account moves from other servers, public profile pages at `https://<domain>/@name`, and NodeInfo. Not (yet): lists, filters, scheduled posts, translations, trends, reports, and relays. Posts from people you don't follow only arrive when someone you follow boosts or replies to them, or when you look them up.
+- Scute signs its lookups on other servers with a server key (the actor at `https://<domain>/instance-actor`; `/actor` before 1.20.2). If a server refuses it, for example because it still remembers an earlier program on the same domain, Scute retries with the first account's own key.
+- Deliveries to other servers are queued and retried with backoff for about three days. `SCUTE_FEDI=off` turns the Fediverse off again without losing anything; it's also off when plug-ins are off.
+
 ## Scute in Joplin
 
 The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in scute-extras) signs in to your Scute server and shows your notes in a panel beside the editor, decrypted on your computer. You can read them, insert them into a Joplin note, copy them (with attachments) into notebooks, and send Joplin notes to Scute, encrypted. It needs Scute 1.17.0 or later and `SCUTE_API_CORS` left on. Unlike a Joplin space, nothing passes through Joplin Server and password notes stay encrypted unless you choose to copy them.
@@ -268,13 +321,26 @@ The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in s
 | `SCUTE_ARCHIVE` | `on` | Set to `off` to disable bookmark previews and saved copies (the server-side page fetcher) |
 | `SCUTE_ARCHIVE_PRIVATE` | `off` | Set to `on` to let bookmarks fetch private/LAN addresses |
 | `SCUTE_ARCHIVE_MAX_MB` | `SCUTE_MAX_UPLOAD_MB` | Largest single page or file the fetcher will download |
-| `SCUTE_SHARES` | `on` | Set to `off` to disable published shares (`/shared/…`); also off when plug-ins are off |
+| `SCUTE_MEDIA` | `on` | Set to `off` to stop bookmarks from downloading videos (on only when yt-dlp is found) |
+| `SCUTE_YTDLP` | `yt-dlp` | The yt-dlp program, if it isn't on the `PATH` |
+| `SCUTE_MEDIA_HEIGHT` | `1080` | Highest video resolution a bookmark saves |
+| `SCUTE_MEDIA_MAX_MB` | `SCUTE_MAX_UPLOAD_MB` | Largest video a bookmark saves |
+| `SCUTE_YTDLP_UPDATE` | `on` | Set to `off` to stop running `yt-dlp -U` at start and once a day (it only works when the program is writable, as in the Docker image) |
+| `SCUTE_SHARES` | `on` | Set to `off` to disable published shares (`/shared/…`), including shared bookmark copies |
 | `SCUTE_SHARE_MAX_MB` | `4096` | Largest total size of one published share |
 | `SCUTE_DRIVE` | `on` | Set to `off` to disable Scute Drive (`/dav/`); also off when plug-ins are off |
 | `SCUTE_DRIVE_DIR` | `$SCUTE_DATA_DIR/drive` | Where Scute Drive keeps files, one folder per user |
 | `SCUTE_DRIVE_QUOTA_GB` | `0` | Space per user in GB; `0` for no limit (the disk's free space) |
 | `SCUTE_DRIVE_MAX_FILE_GB` | `50` | Largest single file |
 | `SCUTE_DRIVE_TRASH_DAYS` | `30` | How long deleted and replaced files stay in the trash; `0` deletes at once |
+| `SCUTE_INBOX` | `on` | Set to `off` to stop other apps from sending data to Scute (`/in/…`); also off when plug-ins are off |
+| `SCUTE_INBOX_MAX_KB` | `1024` | Largest single request an app may send to the inbox |
+| `SCUTE_INBOX_MAX_ITEMS` | `200000` | Most requests waiting per inbox address before Scute answers 429 |
+| `SCUTE_FEDI_DOMAIN` | none | Turns the Fediverse on: the domain in handles (`@name@jcm.social`). Must be served by Scute at its root |
+| `SCUTE_FEDI_URL` | `https://<SCUTE_FEDI_DOMAIN>` | Where that domain is reached, if not plain https on the same name |
+| `SCUTE_FEDI_USERS` | anyone | Comma-separated Scute usernames allowed a Fediverse account |
+| `SCUTE_FEDI_MAX_MB` | `100` | Largest file one Fediverse attachment may be |
+| `SCUTE_FEDI` | `on` | Set to `off` to turn the Fediverse off while keeping `SCUTE_FEDI_DOMAIN` set |
 | `SCUTE_BASE_PATH` | none | The path Scute is served under (e.g. `/scute`) when the proxy doesn't send `X-Forwarded-Prefix` |
 | `SCUTE_JOPLIN_URLS` | any | Comma-separated list of Joplin Server URLs users may connect to, e.g. `https://joplin.example.com`. Recommended on shared servers. |
 | `SCUTE_API_CORS` | `on` | Lets apps on other origins (such as the Scute Notes plug-in for Joplin) call `/api` with a Bearer token. Safe because Scute never uses cookies for the API; set to `off` to allow only the Scute web app itself. |
@@ -322,7 +388,10 @@ All endpoints are JSON under `/api`, authenticated with `Authorization: Bearer <
 - `GET /api/spaces/:id/tombstones` — ids of deleted notes/boards (used by Joplin sync)
 - `GET /api/plugins`, `PUT|DELETE /api/plugins/:id`, `POST /api/plugins` (zip body, admin) — plug-in list and management; files are served from `/plugins/<id>/…`
 - `POST /api/web/fetch` — fetches a public URL for bookmark previews and saved copies
+- `POST /api/web/media` `{url}`, `GET /api/web/media/:id`, `GET /api/web/media/:id/file`, `DELETE /api/web/media/:id` — server-side video downloads for saved copies (yt-dlp); the file is deleted once fetched
 - `GET /api/shares[?plugin=]`, `GET|PATCH|DELETE /api/shares/:slug`, `POST /api/shares/:slug/begin`, `PUT /api/shares/:slug/:version/<file>`, `POST /api/shares/:slug/:version/commit` — published shares; public pages and files are at `/shared/<slug>/…` (no login)
+- `GET|POST /api/inbox?plugin=`, `PATCH|DELETE /api/inbox/:id`, `GET /api/inbox-items?plugin=&after=&limit=`, `POST /api/inbox-items/delete` — inbox addresses and the sealed requests waiting in them; apps send to `/in/<id>[/<password>]` (no login, any method)
+- `GET /api/fedi`, `POST /api/fedi/account`, `POST /api/fedi/token`, `GET /api/fedi/apps`, `DELETE /api/fedi/apps/:id`, `POST /api/fedi/account/delete` — the signed-in user's Fediverse account; the Mastodon client API (`/api/v1/…`, `/api/v2/…`, `/oauth/…`) and ActivityPub (`/.well-known/webfinger`, `/users/<name>`, `/inbox`) are served on both the Scute address and the Fediverse domain
 - `POST /api/plugins-net` — network relay for plug-ins, limited to `SCUTE_PLUGIN_NET`
 - `ANY /api/joplin/<joplin api path>` with `X-Joplin-Url` — relay to a Joplin Server's sync API
 

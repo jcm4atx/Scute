@@ -9,16 +9,27 @@ import { embedFor, makeVideoPoster } from "./media";
 export type LinkKind = "page" | "image" | "video" | "audio" | "file";
 
 let features: string[] | null = null;
+let featuresP: Promise<string[]> | null = null;
+/** The server's optional features (from /api/health), fetched once. */
+export async function serverFeatures(): Promise<string[]> {
+  if (features) return features;
+  featuresP ||= api<{ features: string[] }>("GET", "/api/health")
+    .then((r) => (features = r.features || []))
+    .catch(() => {
+      featuresP = null;
+      return [] as string[];
+    });
+  return featuresP;
+}
+/** What's known so far without waiting (null until /api/health answered). */
+export const knownFeatures = () => features;
 /** True when this server can fetch web pages (SCUTE_ARCHIVE not off). */
 export async function webEnabled(): Promise<boolean> {
-  if (!features) {
-    try {
-      features = (await api<{ features: string[] }>("GET", "/api/health")).features || [];
-    } catch {
-      return false;
-    }
-  }
-  return features.includes("web-archive");
+  return (await serverFeatures()).includes("web-archive");
+}
+/** True when this server can download videos (yt-dlp installed, SCUTE_MEDIA not off). */
+export async function mediaEnabled(): Promise<boolean> {
+  return (await serverFeatures()).includes("media-download");
 }
 
 export interface Fetched {
@@ -152,6 +163,7 @@ export function guessKind(url?: string | null): LinkKind | null {
   } catch {
     /* raw */
   }
+  if (/\/wiki\/[^/]+:/.test(path)) return null; // a wiki page about a file (Commons "File:x.jpg")
   if (IMG_EXT.test(path)) return "image";
   if (VID_EXT.test(path)) return "video";
   if (AUD_EXT.test(path)) return "audio";
@@ -198,17 +210,57 @@ const abs = (u: string | undefined | null, base: string) => {
 };
 
 /** Read title, description, preview image and kind from a page's HTML. */
-export function pageInfo(html: string, base: string): Omit<LinkPreview, "url" | "kind"> & { video?: boolean } {
+/** Sites whose pages are mostly one picture (their og:image is the picture itself). */
+const PHOTO_PAGE = [
+  /(^|\.)imgur\.com$/,
+  /(^|\.)flickr\.com$/,
+  /(^|\.)unsplash\.com$/,
+  /(^|\.)pexels\.com$/,
+  /(^|\.)pixabay\.com$/,
+  /(^|\.)deviantart\.com$/,
+  /(^|\.)artstation\.com$/,
+  /(^|\.)500px\.com$/,
+  /(^|\.)ibb\.co$/,
+  /(^|\.)imgbox\.com$/,
+  /(^|\.)postimg\.cc$/,
+  /(^|\.)gyazo\.com$/,
+  /(^|\.)pinterest\.[a-z.]+$/,
+];
+const PHOTO_PATH = /\/(photos?|art|artwork|pin|gallery|image|images)\/[^/]/i;
+const IMAGE_HOSTS = /(^|\.)(imgur\.com|ibb\.co|imgbox\.com|postimg\.cc|gyazo\.com)$/;
+export function isPhotoPage(url: string, ogType = "", card = "") {
+  if (/(^|[.:])(photo|image|picture)$/i.test(ogType) || card === "photo") return true;
+  try {
+    const u = new URL(url);
+    const h = u.hostname.replace(/^www\./, "");
+    if (/^commons\.wikimedia\.org$/.test(h)) return /^\/wiki\/File:.+\.(jpe?g|png|gif|webp|tiff?)$/i.test(decodeURIComponent(u.pathname));
+    return PHOTO_PAGE.some((r) => r.test(h)) && (IMAGE_HOSTS.test(h) || PHOTO_PATH.test(u.pathname));
+  } catch {
+    return false;
+  }
+}
+
+function isWikiMediaFile(url: string, ext: RegExp) {
+  try {
+    const p = decodeURIComponent(new URL(url).pathname);
+    return /\/wiki\/File:/.test(p) && ext.test(p);
+  } catch {
+    return false;
+  }
+}
+
+export function pageInfo(html: string, base: string): Omit<LinkPreview, "url" | "kind"> & { video?: boolean; photo?: boolean } {
   const doc = new DOMParser().parseFromString(html, "text/html");
   const baseHref = abs(doc.querySelector("base[href]")?.getAttribute("href"), base) || base;
   const ogType = (meta(doc, "og:type") || "").toLowerCase();
-  const video = ogType.startsWith("video") || !!meta(doc, "og:video", "og:video:url", "og:video:secure_url", "twitter:player") || meta(doc, "twitter:card") === "player";
+  const video = ogType.startsWith("video") || !!meta(doc, "og:video", "og:video:url", "og:video:secure_url", "twitter:player") || meta(doc, "twitter:card") === "player" || isWikiMediaFile(base, /\.(webm|ogv|mp4|mov|mkv|ogg|oga|opus|mp3|wav|flac)$/i);
   let image = abs(meta(doc, "og:image:secure_url", "og:image", "og:image:url", "twitter:image", "twitter:image:src", "thumbnailUrl", "image"), baseHref);
   if (!image) image = abs(doc.querySelector('link[rel="image_src"]')?.getAttribute("href"), baseHref);
   const title = (meta(doc, "og:title", "twitter:title") || doc.title || "").replace(/\s+/g, " ").trim().slice(0, 300) || undefined;
   const description = (meta(doc, "og:description", "twitter:description", "description") || "").replace(/\s+/g, " ").trim().slice(0, 500) || undefined;
   const site = meta(doc, "og:site_name", "application-name")?.slice(0, 100);
-  return { title, description, site, image, video };
+  const photo = !video && !!image && isPhotoPage(base, ogType, meta(doc, "twitter:card") || "");
+  return { title, description, site, image, video, photo };
 }
 
 /** Look a link up: what it is (image, video, page…), its title and a preview image. */
@@ -254,7 +306,7 @@ export async function inspectLink(url: string, signal?: AbortSignal): Promise<Li
     return { kind, url: f.finalUrl, mime: f.type, title, image: kind === "image" ? f.finalUrl : undefined };
   }
   const info = pageInfo(decodeText(f), f.finalUrl);
-  return { kind: info.video ? "video" : "page", url: f.finalUrl, title: info.title, description: info.description, site: info.site, image: info.image, mime: f.type };
+  return { kind: info.video ? "video" : info.photo ? "image" : "page", url: f.finalUrl, title: info.title, description: info.description, site: info.site, image: info.image, mime: f.type };
 }
 
 async function thumbFromBlob(blob: Blob, max = 560): Promise<{ thumb: string; width: number; height: number } | null> {
@@ -355,20 +407,208 @@ function safeName(s: string) {
 }
 const stamp = (d = new Date()) => d.toISOString().slice(0, 10);
 
+/** Videos on YouTube, Vimeo and similar sites can only be saved when the server can download them (yt-dlp). */
+export function hostedVideo(url?: string | null) {
+  const k = embedFor(url)?.kind;
+  return k === "youtube" || k === "vimeo";
+}
+/** Whether a copy can be saved at all. `media`: the server can download videos (defaults to what's known). */
+export function canArchive(url?: string | null, media = knownFeatures()?.includes("media-download") ?? false) {
+  return !!url && (media || !hostedVideo(url));
+}
+
+export type ArchiveAs = "auto" | "page" | "image" | "video";
+
+export interface ArchivedMedia extends Archived {
+  via?: "page" | "file" | "image" | "yt-dlp";
+  duration?: number;
+  width?: number;
+  height?: number;
+  uploader?: string;
+  site?: string;
+  description?: string;
+  /** Set when the video or image couldn't be saved and the page was saved instead. */
+  fallback?: string;
+}
+
+/**
+ * Save a copy of what a bookmark points to, ArchiveBox-style:
+ *  - a video page (YouTube, Vimeo, PeerTube… anything yt-dlp knows) → the video, downloaded by the server
+ *  - a photo page (Flickr, Imgur…, or og:type photo) → the full-size picture
+ *  - an image, video, audio or other file link → the file itself
+ *  - any other page → a self-contained copy of the page
+ * `as` forces one of them; `hint` is the bookmark's preview (kind and image) if known.
+ */
+export async function archiveLink(
+  url: string,
+  opts: { signal?: AbortSignal; onProgress?: (msg: string) => void; maxBytes?: number; as?: ArchiveAs; hint?: { kind?: LinkKind; image?: string } } = {},
+): Promise<ArchivedMedia> {
+  const as = opts.as || "auto";
+  const media = await mediaEnabled();
+  const hosted = hostedVideo(url);
+  if (as === "video" || (as === "auto" && (hosted || (opts.hint?.kind === "video" && media)))) {
+    if (!media) throw new Error(hosted ? "This server can't download videos (yt-dlp isn't installed), so Scute keeps the title and thumbnail." : "This server can't download videos (yt-dlp isn't installed).");
+    try {
+      return await downloadVideo(url, opts);
+    } catch (e) {
+      if ((e as Error).name === "AbortError" || as === "video" || hosted) throw e;
+      const page = await archivePage(url, opts);
+      return { ...page, fallback: `The video couldn't be downloaded (${(e as Error).message}), so the page was saved instead.` };
+    }
+  }
+  if (as === "image" || (as === "auto" && opts.hint?.kind === "image" && opts.hint.image && guessKind(url) !== "image")) {
+    try {
+      return await savePicture(url, opts);
+    } catch (e) {
+      if ((e as Error).name === "AbortError" || as === "image") throw e;
+      const page = await archivePage(url, opts);
+      return { ...page, fallback: `The picture couldn't be saved (${(e as Error).message}), so the page was saved instead.` };
+    }
+  }
+  return archivePage(url, opts);
+}
+
+/** The full-size picture of a photo page (its og:image), or the image itself for an image link. */
+async function savePicture(url: string, opts: { signal?: AbortSignal; onProgress?: (msg: string) => void; maxBytes?: number; hint?: { image?: string } }): Promise<ArchivedMedia> {
+  const { signal, onProgress } = opts;
+  onProgress?.("Finding the picture…");
+  let img = guessKind(url) === "image" ? url : undefined;
+  let page = url;
+  let title: string | undefined;
+  let site: string | undefined;
+  let description: string | undefined;
+  if (!img) {
+    const f = await webFetch(url, { maxBytes: 2 * 1024 * 1024, partial: true, signal });
+    if (f.status >= 400) throw new Error(`The site answered ${f.status}`);
+    if (kindOfMime(f.type) === "image") img = f.finalUrl;
+    else {
+      const info = pageInfo(decodeText(f), f.finalUrl);
+      img = info.image || opts.hint?.image;
+      page = f.finalUrl;
+      title = info.title;
+      site = info.site;
+      description = info.description;
+    }
+  }
+  if (!img) throw new Error("the page has no picture to save");
+  onProgress?.("Downloading the picture…");
+  const f = await webFetch(img, {
+    maxBytes: opts.maxBytes,
+    signal,
+    accept: "image/avif,image/webp,image/*,*/*;q=0.5",
+    onProgress: (g, t) => onProgress?.(t ? `Downloading the picture ${Math.round((g / t) * 100)}%…` : `Downloading the picture ${(g / 1048576).toFixed(1)} MB…`),
+  });
+  if (f.status >= 400) throw new Error(`the picture's server answered ${f.status}`);
+  if (f.truncated) throw new Error("the picture is larger than this server saves");
+  const type = f.type.startsWith("image/") ? f.type : extMime(f.finalUrl).startsWith("image/") ? extMime(f.finalUrl) : "";
+  if (!type) throw new Error("what the page points to isn't a picture");
+  const ext = ({ "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "image/svg+xml": "svg" } as Record<string, string>)[type] || type.split("/")[1].replace(/\W.*/, "") || "img";
+  const last = (() => {
+    try {
+      return decodeURIComponent(new URL(f.finalUrl).pathname.split("/").pop() || "");
+    } catch {
+      return "";
+    }
+  })();
+  const base = title ? safeName(title) : last.replace(/\.[^.]+$/, "") || "picture";
+  const dims = await imageSize(new Blob([f.bytes as BlobPart], { type }));
+  return { file: new File([f.bytes as BlobPart], `${safeName(base)}.${ext}`, { type }), kind: "image", title, url: img === url ? f.finalUrl : page, resources: 0, skipped: 0, via: "image", site, description, ...dims };
+}
+
+async function imageSize(blob: Blob): Promise<{ width?: number; height?: number }> {
+  try {
+    const b = await createImageBitmap(blob);
+    const r = { width: b.width, height: b.height };
+    b.close();
+    return r;
+  } catch {
+    return {};
+  }
+}
+
+interface MediaJob {
+  id: string;
+  state: "running" | "done" | "error";
+  phase: string;
+  percent: number | null;
+  bytes: number;
+  total: number | null;
+  error: string | null;
+  info: { title?: string; uploader?: string; duration?: number; width?: number; height?: number; site?: string; webpage?: string; description?: string; ext?: string; type?: string; size?: number; audioOnly?: boolean } | null;
+}
+
+/** Have the server download the video on a page (yt-dlp), then fetch the file. */
+export async function downloadVideo(url: string, opts: { signal?: AbortSignal; onProgress?: (msg: string) => void; maxBytes?: number } = {}): Promise<ArchivedMedia> {
+  const { signal, onProgress } = opts;
+  onProgress?.("Looking up the video…");
+  let j = await api<MediaJob>("POST", "/api/web/media", { url });
+  const cancel = () => void api("DELETE", `/api/web/media/${j.id}`).catch(() => undefined);
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    while (j.state === "running") {
+      await new Promise((r) => setTimeout(r, 1000));
+      if (signal?.aborted) throw new DOMException("Cancelled", "AbortError");
+      j = await api<MediaJob>("GET", `/api/web/media/${j.id}`);
+      if (j.state === "running")
+        onProgress?.(j.percent != null ? `${j.phase} on the server, ${j.percent}%…` : j.bytes ? `${j.phase} on the server, ${(j.bytes / 1048576).toFixed(1)} MB…` : `${j.phase}…`);
+    }
+    if (j.state === "error") throw new Error(j.error || "The download failed");
+    const info = j.info || {};
+    if (opts.maxBytes && (info.size || 0) > opts.maxBytes) throw new Error(`The video is ${((info.size || 0) / 1048576).toFixed(0)} MB, over this server's upload limit`);
+    // fetch the finished file (the server deletes it once sent)
+    const headers: Record<string, string> = {};
+    const t = getToken();
+    if (t) headers.Authorization = `Bearer ${t}`;
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}/api/web/media/${j.id}/file`, { headers, cache: "no-store", signal });
+    } catch (e) {
+      if ((e as Error).name === "AbortError") throw e;
+      throw new NetworkError((e as Error).message || "Network error");
+    }
+    if (!res.ok) throw new ApiError(res.status, (await res.json().catch(() => null))?.message || res.statusText);
+    const total = Number(res.headers.get("content-length") || 0) || info.size || 0;
+    const reader = res.body!.getReader();
+    const chunks: Uint8Array[] = [];
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      got += value.length;
+      onProgress?.(total ? `Fetching the video ${Math.round((got / total) * 100)}%…` : `Fetching the video ${(got / 1048576).toFixed(1)} MB…`);
+    }
+    const type = res.headers.get("x-media-type") || info.type || "video/mp4";
+    const ext = info.ext || type.split("/")[1] || "mp4";
+    const name = `${safeName(info.title || "video")}.${ext}`;
+    return {
+      file: new File(chunks as BlobPart[], name, { type }),
+      kind: info.audioOnly || type.startsWith("audio/") ? "audio" : "video",
+      title: info.title || undefined,
+      url: info.webpage || url,
+      resources: 0,
+      skipped: 0,
+      via: "yt-dlp",
+      duration: info.duration || undefined,
+      width: info.width || undefined,
+      height: info.height || undefined,
+      uploader: info.uploader || undefined,
+      site: info.site || undefined,
+      description: info.description || undefined,
+    };
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+  }
+}
+
 /**
  * A self-contained copy of a page, in the spirit of ArchiveBox's SingleFile
  * output: scripts removed, stylesheets, images and fonts inlined as data: URIs,
  * links made absolute. Images, videos, audio and other files are saved as-is.
  */
-/** YouTube and Vimeo videos can't be downloaded from the browser; Scute keeps their preview instead. */
-export function canArchive(url?: string | null) {
-  const k = embedFor(url)?.kind;
-  return !!url && k !== "youtube" && k !== "vimeo";
-}
-
-export async function archiveLink(url: string, opts: { signal?: AbortSignal; onProgress?: (msg: string) => void; maxBytes?: number } = {}): Promise<Archived> {
+export async function archivePage(url: string, opts: { signal?: AbortSignal; onProgress?: (msg: string) => void; maxBytes?: number } = {}): Promise<ArchivedMedia> {
   const { signal, onProgress } = opts;
-  if (!canArchive(url)) throw new Error("Videos on YouTube and Vimeo can't be saved; Scute keeps the title and thumbnail.");
+  if (hostedVideo(url)) throw new Error("Pages on YouTube and Vimeo can't be saved; save the video instead.");
   onProgress?.("Fetching the page…");
   const main = await webFetch(url, { maxBytes: opts.maxBytes, signal, onProgress: (g, t) => onProgress?.(t ? `Downloading ${Math.round((g / t) * 100)}%…` : `Downloading ${(g / 1048576).toFixed(1)} MB…`) });
   if (main.status >= 400) throw new Error(`The site answered ${main.status}`);
@@ -383,10 +623,12 @@ export async function archiveLink(url: string, opts: { signal?: AbortSignal; onP
   if (kind !== "page" || (main.type && !/html|xml|text\/plain/.test(main.type))) {
     const last = decodeURIComponent(new URL(main.finalUrl).pathname.split("/").pop() || "") || host;
     const name = safeName(last.includes(".") ? last : `${last}.${(main.type.split("/")[1] || "bin").replace(/\W.*/, "")}`);
-    return { file: new File([main.bytes], name, { type: main.type || "application/octet-stream" }), kind: kind === "page" ? "file" : kind, url: main.finalUrl, resources: 0, skipped: 0 };
+    const file = new File([main.bytes as BlobPart], name, { type: main.type || "application/octet-stream" });
+    const dims = kind === "image" ? await imageSize(file) : {};
+    return { file, kind: kind === "page" ? "file" : kind, url: main.finalUrl, resources: 0, skipped: 0, via: "file", ...dims };
   }
   if (main.type === "text/plain") {
-    return { file: new File([main.bytes], `${safeName(host)} ${stamp()}.txt`, { type: "text/plain" }), kind: "page", url: main.finalUrl, resources: 0, skipped: 0 };
+    return { file: new File([main.bytes as BlobPart], `${safeName(host)} ${stamp()}.txt`, { type: "text/plain" }), kind: "page", url: main.finalUrl, resources: 0, skipped: 0, via: "page" };
   }
 
   const html = decodeText(main);
@@ -614,5 +856,6 @@ export async function archiveLink(url: string, opts: { signal?: AbortSignal; onP
     url: main.finalUrl,
     resources,
     skipped,
+    via: "page",
   };
 }

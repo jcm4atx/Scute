@@ -14,9 +14,13 @@ services:
       # SCUTE_PLUGINS: "off"   # plug-ins are on by default; installed ones live in ./data/plugins
       # SCUTE_ARCHIVE_PRIVATE: "on"   # let bookmark previews/saved copies reach LAN addresses
       # SCUTE_ARCHIVE_MAX_MB: "200"   # largest page or file a bookmark will save
+      # SCUTE_MEDIA: "off"            # video downloads for bookmarks (yt-dlp, in the image)
+      # SCUTE_MEDIA_HEIGHT: "1080"    # highest video resolution to save
       # SCUTE_PLUGIN_NET: "http://host.docker.internal:11434"   # addresses plug-ins may reach through the server
       # SCUTE_SHARES: "off"   # published shares at /shared/ are on by default
       # SCUTE_DRIVE_QUOTA_GB: "100"   # Scute Drive (WebDAV at /dav/): files in ./data/drive/<user>/
+      # SCUTE_INBOX: "off"           # stop phone apps (OwnTracks…) sending to /in/
+      # SCUTE_FEDI_DOMAIN: "jcm.social"   # Fediverse handles @name@jcm.social (see README)
     # extra_hosts: ["host.docker.internal:host-gateway"]   # lets the container reach services on the Docker host
     volumes:
       - ./data:/data

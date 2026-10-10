@@ -3,7 +3,13 @@ import express, { Response, NextFunction } from 'express';
 import type { Request } from 'express';
 import { registerRoutes } from "./routes";
 import { serveStatic } from "./static";
+import { fediHostGate } from "./fedi";
 import { createServer } from "node:http";
+
+// One failed background job (a Fediverse delivery, a lookup that times out)
+// must not take the whole server down; log it and keep serving.
+process.on("unhandledRejection", (e) => console.error("[scute] unhandled rejection (kept running):", e));
+process.on("uncaughtException", (e) => console.error("[scute] uncaught exception (kept running):", e));
 
 const app = express();
 const httpServer = createServer(app);
@@ -15,6 +21,7 @@ declare module "http" {
 }
 
 app.disable("x-powered-by");
+app.use(fediHostGate);
 app.set("trust proxy", ["1", "true", "yes"].includes((process.env.SCUTE_TRUST_PROXY || "").toLowerCase()) ? 1 : false);
 app.use((_req, res, next) => {
   res.setHeader("X-Content-Type-Options", "nosniff");
@@ -27,16 +34,17 @@ app.use((_req, res, next) => {
 if (!["off", "0", "false", "no"].includes((process.env.SCUTE_API_CORS || "").toLowerCase())) {
   app.use("/api", (req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type");
+    res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Type, Link");
     if (req.method !== "OPTIONS") return next();
-    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE");
-    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+    res.setHeader("Access-Control-Allow-Methods", "GET, PUT, POST, PATCH, DELETE");
+    res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type, Idempotency-Key, Accept");
     res.setHeader("Access-Control-Max-Age", "600");
     res.status(204).end();
   });
 }
 // WebDAV (Scute Drive) bodies are files: never parse them
-const notDav = (req: any) => !/^\/dav(\/|$)/.test(req.url || "");
+// (nor the inbox's, which keeps exactly what the sending app sent)
+const notDav = (req: any) => !/^\/(dav|in)(\/|$)/.test(req.url || "");
 app.use(
   express.json({
     type: (req) => notDav(req) && /json/i.test(String(req.headers["content-type"] || "")),

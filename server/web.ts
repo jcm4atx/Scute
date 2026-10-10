@@ -28,7 +28,7 @@ function privateV4(ip: string) {
   const [a, b] = ip.split(".").map(Number);
   return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 198 && (b === 18 || b === 19)) || a >= 224;
 }
-function privateIp(ip: string) {
+export function privateIp(ip: string) {
   if (net.isIPv4(ip)) return privateV4(ip);
   const x = ip.toLowerCase();
   const mapped = x.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
@@ -36,7 +36,7 @@ function privateIp(ip: string) {
   return x === "::" || x === "::1" || x.startsWith("fc") || x.startsWith("fd") || x.startsWith("fe8") || x.startsWith("fe9") || x.startsWith("fea") || x.startsWith("feb") || x.startsWith("ff");
 }
 
-async function checkHost(u: URL, HttpError: any) {
+export async function checkHost(u: URL, HttpError: any) {
   if (!/^https?:$/.test(u.protocol)) throw new HttpError(400, "Only http:// and https:// links can be fetched");
   if (u.username || u.password) throw new HttpError(400, "Links with a user name or password can't be fetched");
   if (ALLOW_PRIVATE) return;

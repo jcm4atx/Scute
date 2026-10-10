@@ -28,7 +28,9 @@ export class ApiError extends Error {
   }
 }
 /** Thrown when the request never reached the server (offline, DNS, etc). */
-export class NetworkError extends Error {}
+export class NetworkError extends Error {
+  name = "NetworkError";
+}
 
 export async function api<T = any>(method: string, url: string, body?: unknown, raw?: BodyInit): Promise<T> {
   const headers: Record<string, string> = {};
@@ -76,9 +78,9 @@ export async function apiDownload(url: string, onProgress?: (frac: number) => vo
   let res: Response;
   try {
     res = await fetch(`${API_BASE}${url}`, { headers, cache: "no-store" });
-  } catch (e) {
+  } catch {
     onReach?.(false);
-    throw new NetworkError((e as Error)?.message || "Network error");
+    throw new NetworkError("Couldn't reach your server. Try again in a moment.");
   }
   onReach?.(!gateway(res.status));
   if (res.status === 401 && token) onUnauthorized?.();
@@ -87,24 +89,40 @@ export async function apiDownload(url: string, onProgress?: (frac: number) => vo
     throw new ApiError(res.status, res.statusText);
   }
   const total = Number(res.headers.get("content-length") || 0);
-  if (!res.body || !onProgress || !total) return new Uint8Array(await res.arrayBuffer());
-  const out = new Uint8Array(total);
-  const reader = res.body.getReader();
-  let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (got + value.length > out.length) {
-      // server sent more than advertised (e.g. compression); fall back to growing
-      const bigger = new Uint8Array(Math.max(out.length * 2, got + value.length));
-      bigger.set(out.subarray(0, got));
-      return finishGrow(bigger, got, value, reader, onProgress, total);
+  // A connection that drops part-way through must not hand back a short file:
+  // it would fail to decrypt and look like damaged data.
+  const cut = (_e?: unknown) => {
+    onReach?.(false);
+    return new NetworkError("The connection dropped during the download. Try again.");
+  };
+  try {
+    if (!res.body || !onProgress || !total) {
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (total && !res.headers.get("content-encoding") && buf.length !== total) throw cut();
+      return buf;
     }
-    out.set(value, got);
-    got += value.length;
-    onProgress(Math.min(1, got / total));
+    const out = new Uint8Array(total);
+    const reader = res.body.getReader();
+    let got = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (got + value.length > out.length) {
+        // server sent more than advertised (e.g. compression); fall back to growing
+        const bigger = new Uint8Array(Math.max(out.length * 2, got + value.length));
+        bigger.set(out.subarray(0, got));
+        return await finishGrow(bigger, got, value, reader, onProgress, total);
+      }
+      out.set(value, got);
+      got += value.length;
+      onProgress(Math.min(1, got / total));
+    }
+    if (got !== out.length && !res.headers.get("content-encoding")) throw cut();
+    return got === out.length ? out : out.slice(0, got);
+  } catch (e) {
+    if (e instanceof NetworkError) throw e;
+    throw cut(e);
   }
-  return got === out.length ? out : out.slice(0, got);
 }
 
 async function finishGrow(
