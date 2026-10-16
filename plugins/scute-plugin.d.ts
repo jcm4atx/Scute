@@ -20,6 +20,21 @@ export interface PlainNote {
   modified: number;
   /** This plug-in's private data on the note. */
   data?: unknown;
+  /** API 11, "passwords" permission: the user name and password of password notes. */
+  username?: string;
+  password?: string;
+}
+
+export interface BitwardenAccount {
+  id: string;
+  email: string;
+  name: string;
+  created: number;
+  revision: number;
+  kdf: { type: number; iterations: number; memory: number | null; parallelism: number | null };
+  /** The user key, encrypted with the master key (EncString) */
+  key: string;
+  apiKey: boolean;
 }
 
 export interface Ctx {
@@ -143,7 +158,7 @@ type Off = () => void;
 
 export interface Scute {
   readonly version: string;
-  readonly apiVersion: 1 | 2 | 3 | 4 | 5 | 6;
+  readonly apiVersion: 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11;
   readonly plugin: { id: string; name: string; version: string; permissions: string[] };
 
   context(): Ctx;
@@ -195,10 +210,80 @@ export interface Scute {
     /** notes:write (API 2). One request; needs a connection. */
     createMany(spaceId: string, inputs: (NoteInput & { boardId?: string | null })[], onProgress?: (done: number, total: number) => void): Promise<string[]>;
     /** notes:write */
-    update(id: string, patch: Omit<NoteInput, "type"> & { boardId?: string | null }): Promise<void>;
+    update(id: string, patch: Omit<NoteInput, "type"> & { boardId?: string | null; /** API 11: move to another space */ spaceId?: string }): Promise<void>;
     /** notes:write */
     delete(id: string): Promise<void>;
+    /** notes:write (API 11). Move notes to another space or board, like the Move button. */
+    move(ids: string[], to: { spaceId: string; boardId?: string | null }): Promise<{ moved: number; failed: { title: string; error: string }[] }>;
     open(id: string): void;
+  };
+
+  /** API 11, bitwarden: the user's account on the Bitwarden-compatible server at <scute>/bw (ciphertext only; the plug-in encrypts). */
+  bitwarden: {
+    info(): Promise<{ enabled: boolean; url: string; version: string; account: BitwardenAccount | null; devices: { id: string; name: string; type: number; kind: string; created: number; lastSeen: number }[] }>;
+    createAccount(body: { email: string; name?: string; masterPasswordHash: string; key: string; publicKey: string; privateKey: string; kdf: { kdfType: 0 | 1; iterations: number; memory?: number | null; parallelism?: number | null } }): Promise<{ account: BitwardenAccount; url: string }>;
+    updateAccount(patch: { name?: string }): Promise<{ account: BitwardenAccount }>;
+    /** confirm: the account's email address */
+    deleteAccount(confirm: string): Promise<void>;
+    /** Sign every Bitwarden app out. */
+    signOutAll(): Promise<void>;
+    removeDevice(id: string): Promise<void>;
+    /** Every cipher (as the apps see it, plus revision and mirror) and folder. */
+    vault(): Promise<{ accountId: string; revision: number; ciphers: any[]; folders: { id: string; name: string; revision: number; mirror: Json | null }[] }>;
+    /** Create or replace a cipher; expect = the revision you last saw (null for a new one), else 409. */
+    putCipher(id: string, body: { cipher: object; mirror?: Json | null; expect: number | null; deleted?: boolean }): Promise<any>;
+    setCipherMirror(id: string, mirror: Json | null, expect?: number): Promise<{ ok: boolean; revision: number }>;
+    trashCipher(id: string, opts?: { expect?: number; mirror?: Json | null }): Promise<any>;
+    deleteCipher(id: string): Promise<void>;
+    putFolder(id: string, body: { name: string; mirror?: Json | null }): Promise<{ id: string; name: string; revision: number; mirror: Json | null }>;
+    setFolderMirror(id: string, mirror: Json | null): Promise<void>;
+    deleteFolder(id: string): Promise<void>;
+    /** A lease so only one browser works on the vault at a time. */
+    lock(holder: string, opts?: { ttl?: number; release?: boolean }): Promise<{ ok: boolean; holder: string | null; until: number | null }>;
+    /** A Bitwarden app changed the vault (while this page is open). */
+    onChange(cb: () => void): Off;
+  };
+
+  /**
+   * API 12, library: ebooks, magazines and comics, stored as ordinary (unencrypted) files on
+   * the server with their details, and served to e-reader apps as an OPDS catalog at /opds/.
+   */
+  library: {
+    info(): Promise<{ enabled: boolean; username: string; opds: string; books: number; files: number; bytes: number; maxFile: number; formats: string[] }>;
+    list(): Promise<LibraryBook[]>;
+    get(id: string): Promise<LibraryBook>;
+    /** Upload a new book. A file that's already in the library isn't stored twice: { duplicate: { id, format } }. */
+    add(file: Blob, opts?: { name?: string; meta?: LibraryMeta; onProgress?: (done: number, total: number) => void; signal?: AbortSignal }): Promise<{ book: LibraryBook; duplicate?: { id: string; format: string } }>;
+    /** Another format of the same book (replaces that format if present). */
+    addFile(id: string, file: Blob, opts?: { name?: string; onProgress?: (done: number, total: number) => void; signal?: AbortSignal }): Promise<{ book: LibraryBook; duplicate?: { id: string; format: string } }>;
+    removeFile(id: string, format: string): Promise<LibraryBook>;
+    update(id: string, meta: LibraryMeta): Promise<LibraryBook>;
+    setCover(id: string, image: Blob | null): Promise<LibraryBook>;
+    remove(id: string): Promise<void>;
+    /** <img src> for the cover (no sign-in needed, about a week); call list() or info() first. */
+    coverUrl(book: { id: string; cover: number }): string | null;
+    fileUrl(id: string, format: string, opts?: { view?: boolean }): Promise<string>;
+    download(id: string, format: string): Promise<Blob>;
+    /** App passwords for e-reader apps (OPDS sign-in: username + app password). */
+    tokens: {
+      list(): Promise<{ id: string; label: string; created: number; last_used: number | null }[]>;
+      create(label: string): Promise<{ id: string; label: string; token: string }>;
+      remove(id: string): Promise<void>;
+    };
+    /** API 13: book search on IRC (IRCHighway #ebooks by default), done by the server. Absent before API 13. */
+    irc?: {
+      status(): Promise<LibraryIrcStatus>;
+      connect(opts?: { nick?: string }): Promise<LibraryIrcStatus>;
+      disconnect(): Promise<LibraryIrcStatus>;
+      search(q: string, opts?: { nick?: string }): Promise<LibraryIrcJob>;
+      /** command: a result's `command` ("!server file name"). */
+      download(command: string, opts?: { nick?: string }): Promise<LibraryIrcJob>;
+      /** Poll this; search jobs carry `results` once done. */
+      job(id: string): Promise<LibraryIrcJob>;
+      /** The file of a finished download (may be a .zip or .rar holding the book). */
+      file(id: string): Promise<File>;
+      remove(id: string): Promise<void>;
+    };
   };
 
   /** API 3: objects plug-ins share with each other. */
@@ -279,4 +364,85 @@ export interface ShareInfo {
   expires: number | null;
   /** "/shared/<slug>/" */
   path: string;
+}
+
+export interface LibraryFile {
+  format: string;
+  name: string;
+  size: number;
+  sha1: string;
+  added: number;
+}
+export interface LibraryBook {
+  id: string;
+  kind: "book" | "magazine" | "comic";
+  title: string;
+  sortTitle: string;
+  authors: string[];
+  series: string | null;
+  seriesIndex: number | null;
+  issue: string | null;
+  publisher: string | null;
+  published: string | null;
+  language: string | null;
+  isbn: string | null;
+  identifiers: Record<string, string>;
+  description: string | null;
+  subjects: string[];
+  pages: number | null;
+  rating: number | null;
+  files: LibraryFile[];
+  /** 0 = no cover, otherwise when it last changed */
+  cover: number;
+  added: number;
+  modified: number;
+}
+export type LibraryMeta = Partial<Omit<LibraryBook, "id" | "files" | "cover" | "added" | "modified">>;
+
+export interface LibraryIrcResult {
+  bot: string;
+  command: string;
+  file: string;
+  title: string;
+  author: string;
+  series: string | null;
+  format: string;
+  archive: string | null;
+  size: number | null;
+  sizeText: string;
+}
+export interface LibraryIrcJob {
+  id: string;
+  kind: "search" | "download";
+  query?: string;
+  command?: string;
+  bot?: string;
+  label: string;
+  /** downloads: the title and author from the search result */
+  title?: string;
+  author?: string;
+  status: "queued" | "sent" | "receiving" | "done" | "error";
+  message: string;
+  received: number;
+  size: number;
+  name: string;
+  created: number;
+  finished: number | null;
+  count: number | null;
+  matches: number | null;
+  ready: boolean;
+  results?: LibraryIrcResult[];
+}
+export interface LibraryIrcStatus {
+  enabled: boolean;
+  allowed: boolean;
+  server: string;
+  port: number;
+  channel: string;
+  state: "connecting" | "ready" | "closed";
+  nick: string | null;
+  error: string | null;
+  people: number;
+  online: string[];
+  jobs: LibraryIrcJob[];
 }

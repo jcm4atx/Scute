@@ -26,7 +26,7 @@ const BUNDLED_DIR = [path.resolve(__dirname, "plugins"), path.resolve(process.cw
 const STATE_FILE = path.join(INSTALL_DIR, ".state.json");
 const MAX_ZIP = 20 * 1024 * 1024;
 const ID_RE = /^[a-z0-9][a-z0-9._-]{1,63}$/;
-export const PLUGIN_API_VERSION = 10; // 10: fediverse (an ActivityPub account and Mastodon API token); 9: inbox (addresses other apps send data to); 8: drive (Scute Drive WebDAV folder); 2: space kinds, note types, menus, spaces.create, notes.createMany; 3: services, net relay; 4: net.get (public web); 5: files (thumb, url, blob, add); 6: shares (publish at /shared/<name>/); 7: media files in shares, shareAllow
+export const PLUGIN_API_VERSION = 13; // 13: library.irc (book search on IRC); 12: library (ebooks, magazines and comics on the server, served over OPDS); 11: bitwarden (a Bitwarden-compatible vault for the apps), passwords (username/password of password notes), notes.move; 10: fediverse (an ActivityPub account and Mastodon API token); 9: inbox (addresses other apps send data to); 8: drive (Scute Drive WebDAV folder); 2: space kinds, note types, menus, spaces.create, notes.createMany; 3: services, net relay; 4: net.get (public web); 5: files (thumb, url, blob, add); 6: shares (publish at /shared/<name>/); 7: media files in shares, shareAllow
 /** What a share viewer may load besides its own files (plugin.json "shareAllow", API 7). */
 export const SHARE_ALLOW = ["web-images", "web-media", "video-embeds"] as const;
 /**
@@ -45,7 +45,7 @@ export function netAllowed(url: string) {
   if (NET_ALLOW.includes("*")) return true;
   return NET_ALLOW.some((p) => url === p || url.startsWith(p.endsWith("/") ? p : p + "/") || url.startsWith(p + "?"));
 }
-const PERMS = ["notes:read", "notes:write", "storage", "network", "publish", "drive", "inbox", "fediverse"];
+const PERMS = ["notes:read", "notes:write", "storage", "network", "publish", "drive", "inbox", "fediverse", "bitwarden", "passwords", "library"];
 
 export interface PluginManifest {
   id: string;

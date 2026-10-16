@@ -115,6 +115,8 @@ const PERM_TEXT: Record<string, string> = {
   drive: "Use your Scute Drive files",
   inbox: "Receive data other apps send to Scute (e.g. your location)",
   fediverse: "Use your Fediverse account: read and post as you, follow people",
+  bitwarden: "Run your Bitwarden account on this server, for the Bitwarden apps",
+  passwords: "See and change the user names and passwords in password notes",
 };
 
 /** Settings → Plug-ins tab. */

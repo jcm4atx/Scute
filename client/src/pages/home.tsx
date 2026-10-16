@@ -23,6 +23,7 @@ import { NoteCard, NOTE_TYPES } from "@/components/note-parts";
 import { NoteEditor, type EditorTarget } from "@/components/note-editor";
 import { SettingsDialog, SpaceDialog } from "@/components/dialogs";
 import { JoplinBar, JoplinDialog, useJoplinResolver } from "@/components/joplin";
+import { NotebookLinkBar, NotebookLinkDialog, useNotebookLinks } from "@/components/joplin-link";
 import { fetchResource } from "@/lib/joplin";
 import { ResourceContext, type ResourceResolver } from "@/components/note-parts";
 import {
@@ -169,6 +170,12 @@ export default function Home() {
   const fullView = useMemo(() => (pk && full && pk.mount ? { id: pk.id, title: pk.title, mount: pk.mount, pluginId: pk.pluginId, uid: pk.uid } : null), [pk, full]);
   const joplin = kind === "joplin" && v.extras.includes("joplin");
   const [joplinDlg, setJoplinDlg] = useState(false);
+  // Joplin notebook links (1.21.0): ordinary spaces kept in sync with a Joplin notebook by the server
+  const linksOn = v.extras.includes("joplin-links");
+  const { links: nbLinks, reload: reloadLinks } = useNotebookLinks(linksOn);
+  const nbLink = space && linksOn ? nbLinks.find((l) => l.spaceId === space.id) || null : null;
+  const canLink = !!space && linksOn && kind === "notes" && !space.data.kind;
+  const [linkDlg, setLinkDlg] = useState(false);
   const [bmTools, setBmTools] = useState(false);
   const joplinResolver = useJoplinResolver(space, joplin);
   // ":/<id>" links can also point at another Scute note's attachment (a note with several
@@ -586,6 +593,11 @@ export default function Home() {
                 <NotebookPen className="h-4 w-4" /> Joplin connection…
               </DropdownMenuItem>
             )}
+            {canLink && (nbLink || canManage(space!.role)) && (
+              <DropdownMenuItem onClick={() => setLinkDlg(true)} data-testid="menu-notebook-link">
+                <NotebookPen className="h-4 w-4" /> {nbLink ? "Joplin notebook link…" : "Sync with a Joplin notebook…"}
+              </DropdownMenuItem>
+            )}
             {space && (
               <DropdownMenuItem onClick={() => setSpaceDlg({ open: true, create: false })} data-testid="menu-space-settings">
                 <Settings className="h-4 w-4" /> {canManage(space.role) ? "Space settings & sharing" : "Space members"}
@@ -927,6 +939,7 @@ export default function Home() {
               <PluginViewHost key={fullView.uid} view={fullView} ctx={pctx.current} />
             ) : (<>
             {joplin && space && <JoplinBar key={space.id} space={space} onSettings={() => setJoplinDlg(true)} />}
+            {canLink && nbLink && space && <NotebookLinkBar key={space.id} space={space} link={nbLink} onSettings={() => setLinkDlg(true)} onChanged={reloadLinks} />}
             {kind !== "notes" && !pk && !joplin && (
               <p className="rounded-md border px-3 py-2 text-xs text-muted-foreground" data-testid="text-kind-disabled">This space's special view is turned off on this server, so its items are shown as plain notes.</p>
             )}
@@ -1068,6 +1081,7 @@ export default function Home() {
       <RevealDialog open={revealOpen} onOpenChange={setRevealOpen} />
       <PluginDialogHost />
       {joplin && space && <JoplinDialog space={space} open={joplinDlg} onOpenChange={setJoplinDlg} />}
+      {canLink && space && <NotebookLinkDialog space={space} link={nbLink} open={linkDlg} onOpenChange={setLinkDlg} onChanged={reloadLinks} />}
     </div>
     </ResourceContext.Provider>
   );

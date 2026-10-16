@@ -645,8 +645,12 @@ export function registerFediRoutes(app: Express, httpServer: Server, deps: Deps)
   app.post("/api/fedi/token", auth, wrap((req: any, res: Response) => {
     const acc = accountByUser(req.user.id);
     if (!acc) throw new FediError(404, "No Fediverse account");
-    // one token per signed-in Scute device
-    const label = `scute:${String(req.tokenHash).slice(0, 16)}`;
+    // One token per signed-in Scute device and plug-in: a new one replaces only
+    // that plug-in's earlier token on this device (1.23.0; before, plug-ins on
+    // the same device replaced each other's). The Fediverse plug-in keeps the
+    // original label, so its tokens carry on.
+    const plugin = typeof req.body?.plugin === "string" && /^[a-z0-9][a-z0-9._-]{1,63}$/.test(req.body.plugin) && req.body.plugin !== "fediverse" ? req.body.plugin : "";
+    const label = `scute:${String(req.tokenHash).slice(0, 16)}${plugin ? `:${plugin}` : ""}`;
     db.prepare("DELETE FROM fedi_tokens WHERE account_id = ? AND scopes LIKE ?").run(acc.id, `% ${label}`);
     res.json({ token: issueToken(scuteApp(), acc.id, `read write follow push ${label}`), url: FEDI_URL });
   }));

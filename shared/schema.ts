@@ -31,6 +31,28 @@ export interface JoplinLink {
   resId?: string; // resource holding this note's attachment
 }
 
+/**
+ * A Joplin notebook kept in sync with an ordinary space by the server (1.21.0).
+ * Stored encrypted with the space key; the server holds that key for linked spaces.
+ */
+export interface NotebookLinkConfig {
+  url: string;
+  email: string;
+  password: string;
+  notebookId: string; // Joplin folder id (32 hex)
+  notebookTitle: string;
+  interval: number; // seconds between checks of Joplin Server
+}
+
+/** What a notebook link last exchanged for a note or board (1.21.0). */
+export interface NotebookLinkMark {
+  link: string; // link id
+  updated: number; // Joplin updated_time (ms) of that version
+  hash: string; // hash of the synced fields then, to spot Scute edits
+  resId?: string; // Joplin resource holding the note's attachment
+  res?: boolean; // the note is a copy of a Joplin attachment (never sent back as a note)
+}
+
 /** Encrypted per-user preferences (stored with the account, synced to every device). */
 export interface UserSettings {
   defaultSpaceId?: string | null;
@@ -52,6 +74,7 @@ export interface BoardData {
   title: string;
   parentId?: string | null;
   joplin?: JoplinLink;
+  jlink?: NotebookLinkMark;
 }
 
 export interface FileMeta {
@@ -117,6 +140,7 @@ export interface NoteData {
   /** Bookmarks: a saved copy of the page/file is the note's attachment (`file`). */
   archive?: ArchiveInfo | null;
   joplin?: JoplinLink;
+  jlink?: NotebookLinkMark;
   /** Per-plug-in data attached to a note, keyed by plug-in id (encrypted with the note). */
   ext?: Record<string, unknown>;
   created: number;
@@ -165,6 +189,9 @@ export interface RawNote {
 }
 export interface SyncResponse {
   seq: number;
+  /** 1.23.1, with batch=1: more changes follow; ask again with after=<after> */
+  more?: boolean;
+  after?: number;
   extras?: string[];
   full: boolean;
   settings: string | null;

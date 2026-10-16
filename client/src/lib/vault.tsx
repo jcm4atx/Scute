@@ -14,7 +14,8 @@ import type {
   UserSettings,
 } from "@shared/schema";
 import * as C from "./crypto";
-import { api, ApiError, NetworkError, setToken, setUnauthorizedHandler, setReachabilityHandler, apiDownload } from "./api";
+import { API_BASE } from "./queryClient";
+import { api, ApiError, NetworkError, getToken, setToken, setUnauthorizedHandler, setReachabilityHandler, apiDownload } from "./api";
 import { idbDel, idbGet, idbSet, idbClearPrefix } from "./idb";
 
 // ---------- decrypted models ----------
@@ -321,8 +322,16 @@ function useVaultState() {
       setSyncing(true);
       try {
         await flushOutbox();
-        const r = await api<SyncResponse>("GET", `/api/sync?since=${cache.current.seq}`);
-        applySync(r);
+        // big changes come in batches (1.23.1): keep asking until the server says that's all
+        const since = cache.current.seq;
+        let after = 0;
+        for (let page = 0; ; page++) {
+          const r = await api<SyncResponse>("GET", `/api/sync?since=${since}&batch=1${after ? `&after=${after}` : ""}`);
+          applySync(r);
+          if (!r.more) break;
+          if (!(typeof r.after === "number" && r.after > after) || page > 100000) throw new Error("The server's sync didn't move forward");
+          after = r.after;
+        }
         await persist();
         await rebuild();
         setOnline(true);
@@ -919,6 +928,63 @@ function useVaultState() {
       window.clearInterval(t);
     };
   }, [status, sync]);
+
+  // Change notifications (1.21.0): one streaming request tells this tab the moment something
+  // changes in one of its spaces (another device, a Joplin notebook link). The 20-second check
+  // above stays as the fallback, e.g. behind a proxy that buffers the stream.
+  const eventsOn = extras.includes("events");
+  const syncRef = useRef(sync);
+  syncRef.current = sync;
+  useEffect(() => {
+    if (status !== "ready" || !eventsOn) return; // older server, or the first sync hasn't said yet
+    let stop = false;
+    let ctl: AbortController | null = null;
+    let tries = 0;
+    let timer: number | undefined;
+    const connect = async () => {
+      if (stop) return;
+      const tok = getToken();
+      if (!tok || !navigator.onLine) {
+        timer = window.setTimeout(connect, 10_000);
+        return;
+      }
+      ctl = new AbortController();
+      try {
+        const res = await fetch(`${API_BASE}/api/events`, { headers: { Authorization: `Bearer ${tok}`, Accept: "text/event-stream" }, cache: "no-store", signal: ctl.signal });
+        if (!res.ok || !res.body) throw new Error(String(res.status));
+        const rd = res.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await rd.read();
+          if (done) break;
+          tries = 0;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const block = buf.slice(0, i);
+            buf = buf.slice(i + 2);
+            const ev = /^event: (.+)$/m.exec(block)?.[1];
+            const data = /^data: (.*)$/m.exec(block)?.[1];
+            if (ev === "sync") void syncRef.current();
+            else if (ev === "link") window.dispatchEvent(new CustomEvent("scute:links", { detail: data ? JSON.parse(data) : {} }));
+            else if (ev === "bitwarden") window.dispatchEvent(new CustomEvent("scute:bitwarden"));
+          }
+        }
+      } catch {
+        /* dropped: try again below */
+      }
+      if (stop) return;
+      tries++;
+      timer = window.setTimeout(connect, Math.min(60_000, 2000 * 2 ** Math.min(tries, 5)));
+    };
+    void connect();
+    return () => {
+      stop = true;
+      ctl?.abort();
+      window.clearTimeout(timer);
+    };
+  }, [status, eventsOn]);
 
   return useMemo(
     () => ({

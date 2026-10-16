@@ -71,6 +71,9 @@ export interface PlainNote {
   created: number;
   modified: number;
   data?: unknown; // this plug-in's own ext data
+  /** Password notes, for plug-ins with the "passwords" permission (API 11). */
+  username?: string;
+  password?: string;
 }
 export interface Ctx {
   spaceId: string | null;
@@ -439,6 +442,252 @@ function driveApi(need: () => void) {
   };
 }
 
+export interface LibraryFile {
+  format: string;
+  name: string;
+  size: number;
+  sha1: string;
+  added: number;
+}
+export interface LibraryBook {
+  id: string;
+  kind: "book" | "magazine" | "comic";
+  title: string;
+  sortTitle: string;
+  authors: string[];
+  series: string | null;
+  seriesIndex: number | null;
+  issue: string | null;
+  publisher: string | null;
+  published: string | null;
+  language: string | null;
+  isbn: string | null;
+  identifiers: Record<string, string>;
+  description: string | null;
+  subjects: string[];
+  pages: number | null;
+  rating: number | null;
+  files: LibraryFile[];
+  cover: number;
+  added: number;
+  modified: number;
+}
+type LibraryMeta = Partial<Omit<LibraryBook, "id" | "files" | "cover" | "added" | "modified">>;
+type LibraryUpload = { book: LibraryBook; duplicate?: { id: string; format: string } };
+
+/** XHR upload of raw bytes with progress (fetch can't report upload progress). */
+function xhrSend(method: string, url: string, body: Blob, opts: { headers?: Record<string, string>; onProgress?: (done: number, total: number) => void; signal?: AbortSignal } = {}): Promise<any> {
+  return new Promise((ok, bad) => {
+    const x = new XMLHttpRequest();
+    x.open(method, `${API_BASE}${url}`);
+    const t = getToken();
+    if (t) x.setRequestHeader("Authorization", `Bearer ${t}`);
+    x.setRequestHeader("Content-Type", "application/octet-stream");
+    for (const [k, v] of Object.entries(opts.headers || {})) x.setRequestHeader(k, v);
+    x.upload.onprogress = (e) => opts.onProgress?.(e.loaded, e.total || body.size);
+    x.onload = () => {
+      let j: any = null;
+      try {
+        j = JSON.parse(x.responseText);
+      } catch {
+        /* not JSON */
+      }
+      if (x.status >= 200 && x.status < 300) return ok(j);
+      const e = new Error(x.status >= 502 && x.status <= 504 ? unreachable(new NetworkError(String(x.status))) : String(j?.error || j?.message || x.responseText || x.statusText || `Error ${x.status}`).slice(0, 300)) as Error & { status: number };
+      e.status = x.status;
+      bad(e);
+    };
+    x.onerror = () => bad(new Error(unreachable(new NetworkError("upload failed"))));
+    x.onabort = () => bad(new DOMException("Cancelled", "AbortError"));
+    opts.signal?.addEventListener("abort", () => x.abort());
+    x.send(body);
+  });
+}
+
+function libraryApi(need: () => void) {
+  const id = (s: string) => encodeURIComponent(s);
+  let key: { k: string; at: number } | null = null;
+  const abs = (u: string) => new URL(`${API_BASE}${u}`, location.href).href;
+  const info = async () => {
+    need();
+    const r = await api<{ enabled: boolean; username: string; opds: string; key: string; books: number; files: number; bytes: number; maxFile: number; formats: string[] }>("GET", "/api/library");
+    key = { k: r.key, at: Date.now() };
+    const { key: _k, ...rest } = r;
+    return { ...rest, opds: abs("/opds/") };
+  };
+  const linkKey = async () => {
+    if (!key || Date.now() - key.at > 12 * 3600_000) await info();
+    return key!.k;
+  };
+  return {
+    info,
+    async list(): Promise<LibraryBook[]> {
+      need();
+      const [r] = await Promise.all([api<{ books: LibraryBook[] }>("GET", "/api/library/books"), linkKey()]);
+      return r.books;
+    },
+    async get(bookId: string): Promise<LibraryBook> {
+      need();
+      return api<LibraryBook>("GET", `/api/library/books/${id(bookId)}`);
+    },
+    /** Upload a new book from one file; meta (optional) is saved with it. A file already in the library comes back as { duplicate }. */
+    async add(file: Blob, opts: { name?: string; meta?: LibraryMeta; onProgress?: (done: number, total: number) => void; signal?: AbortSignal } = {}): Promise<LibraryUpload> {
+      need();
+      const name = opts.name || (file instanceof File ? file.name : "book");
+      const meta = opts.meta ? encodeURIComponent(JSON.stringify(opts.meta)) : "";
+      return xhrSend("POST", `/api/library/books?name=${id(name)}`, file, { ...opts, headers: meta.length < 7000 && meta ? { "X-Library-Meta": meta } : {} }).then(async (r: LibraryUpload) => {
+        if (opts.meta && !r.duplicate && meta.length >= 7000) r.book = (await api<{ book: LibraryBook }>("PUT", `/api/library/books/${id(r.book.id)}`, opts.meta)).book;
+        return r;
+      });
+    },
+    /** Add (or replace) another format of a book, e.g. the PDF next to the EPUB. */
+    async addFile(bookId: string, file: Blob, opts: { name?: string; onProgress?: (done: number, total: number) => void; signal?: AbortSignal } = {}): Promise<LibraryUpload> {
+      need();
+      const name = opts.name || (file instanceof File ? file.name : "book");
+      return xhrSend("POST", `/api/library/books/${id(bookId)}/files?name=${id(name)}`, file, opts);
+    },
+    async removeFile(bookId: string, format: string): Promise<LibraryBook> {
+      need();
+      return (await api<{ book: LibraryBook }>("DELETE", `/api/library/books/${id(bookId)}/files/${id(format)}`)).book;
+    },
+    /** Change details; only the fields you pass are changed. */
+    async update(bookId: string, meta: LibraryMeta): Promise<LibraryBook> {
+      need();
+      return (await api<{ book: LibraryBook }>("PUT", `/api/library/books/${id(bookId)}`, meta)).book;
+    },
+    /** Set the cover (a JPEG/PNG/WebP picture, up to 15 MB; about 800 px tall is plenty), or null to remove it. */
+    async setCover(bookId: string, image: Blob | null): Promise<LibraryBook> {
+      need();
+      if (!image) return (await api<{ book: LibraryBook }>("DELETE", `/api/library/books/${id(bookId)}/cover`)).book;
+      return (await xhrSend("PUT", `/api/library/books/${id(bookId)}/cover`, image)).book;
+    },
+    async remove(bookId: string): Promise<void> {
+      need();
+      await api("DELETE", `/api/library/books/${id(bookId)}`);
+    },
+    /** Address of a book's cover for <img src> (works without signing in, for about a week). Call list() or info() first. */
+    coverUrl(b: Pick<LibraryBook, "id" | "cover">): string | null {
+      if (!b.cover || !key) return null;
+      return abs(`/api/library/k/${key.k}/cover/${b.id}.jpg?v=${b.cover}`);
+    },
+    /** Address to download one format (works without signing in, for about a week). view: open a PDF in the browser. */
+    async fileUrl(bookId: string, format: string, opts: { view?: boolean } = {}): Promise<string> {
+      need();
+      return abs(`/api/library/k/${await linkKey()}/file/${id(bookId)}/${id(format)}${opts.view ? "?view=1" : ""}`);
+    },
+    async download(bookId: string, format: string): Promise<Blob> {
+      need();
+      const r = await fetch(await this.fileUrl(bookId, format), { credentials: "omit" });
+      if (!r.ok) throw new Error(`Download failed (${r.status})`);
+      return r.blob();
+    },
+    tokens: {
+      async list() {
+        need();
+        return (await api<{ tokens: { id: string; label: string; created: number; last_used: number | null }[] }>("GET", "/api/library/tokens")).tokens;
+      },
+      async create(label: string) {
+        need();
+        return api<{ id: string; label: string; token: string }>("POST", "/api/library/tokens", { label });
+      },
+      async remove(tokenId: string) {
+        need();
+        await api("DELETE", `/api/library/tokens/${id(tokenId)}`);
+      },
+    },
+    /** Book search on IRC (IRCHighway #ebooks by default), done by the server. */
+    irc: {
+      async status(): Promise<LibraryIrcStatus> {
+        need();
+        return api<LibraryIrcStatus>("GET", "/api/library/irc");
+      },
+      async connect(opts: { nick?: string } = {}): Promise<LibraryIrcStatus> {
+        need();
+        return api<LibraryIrcStatus>("POST", "/api/library/irc/connect", opts);
+      },
+      async disconnect(): Promise<LibraryIrcStatus> {
+        need();
+        return api<LibraryIrcStatus>("POST", "/api/library/irc/disconnect");
+      },
+      async search(q: string, opts: { nick?: string } = {}): Promise<LibraryIrcJob> {
+        need();
+        return api<LibraryIrcJob>("POST", "/api/library/irc/search", { q, ...opts });
+      },
+      async download(command: string, opts: { nick?: string } = {}): Promise<LibraryIrcJob> {
+        need();
+        return api<LibraryIrcJob>("POST", "/api/library/irc/download", { command, ...opts });
+      },
+      async job(jobId: string): Promise<LibraryIrcJob> {
+        need();
+        return api<LibraryIrcJob>("GET", `/api/library/irc/jobs/${id(jobId)}`);
+      },
+      /** The downloaded file of a finished download job. */
+      async file(jobId: string): Promise<File> {
+        need();
+        const headers: Record<string, string> = {};
+        const t = getToken();
+        if (t) headers.Authorization = `Bearer ${t}`;
+        const r = await fetch(`${API_BASE}/api/library/irc/jobs/${id(jobId)}/file`, { headers, cache: "no-store" });
+        if (!r.ok) throw new Error(((await r.json().catch(() => null)) as { message?: string } | null)?.message || `Download failed (${r.status})`);
+        const name = decodeURIComponent(r.headers.get("X-File-Name") || "book");
+        return new File([await r.blob()], name);
+      },
+      async remove(jobId: string): Promise<void> {
+        need();
+        await api("DELETE", `/api/library/irc/jobs/${id(jobId)}`);
+      },
+    },
+  };
+}
+
+export interface LibraryIrcResult {
+  bot: string;
+  command: string;
+  file: string;
+  title: string;
+  author: string;
+  series: string | null;
+  format: string;
+  archive: string | null;
+  size: number | null;
+  sizeText: string;
+}
+export interface LibraryIrcJob {
+  id: string;
+  kind: "search" | "download";
+  query?: string;
+  command?: string;
+  bot?: string;
+  label: string;
+  /** downloads: the title and author from the search result */
+  title?: string;
+  author?: string;
+  status: "queued" | "sent" | "receiving" | "done" | "error";
+  message: string;
+  received: number;
+  size: number;
+  name: string;
+  created: number;
+  finished: number | null;
+  count: number | null;
+  matches: number | null;
+  ready: boolean;
+  results?: LibraryIrcResult[];
+}
+export interface LibraryIrcStatus {
+  enabled: boolean;
+  allowed: boolean;
+  server: string;
+  port: number;
+  channel: string;
+  state: "connecting" | "ready" | "closed";
+  nick: string | null;
+  error: string | null;
+  people: number;
+  online: string[];
+  jobs: LibraryIrcJob[];
+}
+
 /** The file of an image/video/file note that never finished uploading (the note was saved, the upload wasn't). */
 function missingFile(n: Note): string {
   const name = n.data.file?.name || n.data.title || "A note";
@@ -462,7 +711,11 @@ export function toPlain(n: Note, pluginId?: string): PlainNote {
     created: d.created,
     modified: d.modified,
     data: pluginId ? structuredCloneSafe(ownedField(d.type, pluginId) ? (d as any)[ownedField(d.type, pluginId)!] : d.ext?.[pluginId]) : undefined,
+    ...(d.type === "password" && pluginId && hasPerm(pluginId, "passwords") ? { username: d.username || "", password: d.password || "" } : {}),
   };
+}
+function hasPerm(pluginId: string, perm: string) {
+  return !!state.list.find((x) => x.id === pluginId)?.permissions.includes(perm);
 }
 /** The note field a plug-in's own note type keeps its data in. */
 function ownedField(type: string, pluginId: string) {
@@ -581,6 +834,10 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
   const cleanPatch = (patch: Partial<PlainNote>) => {
     const out: Partial<NoteData> = {};
     for (const k of NOTE_FIELDS) if (k in patch) (out as any)[k] = (patch as any)[k];
+    if (p.permissions.includes("passwords")) {
+      if (typeof patch.username === "string") out.username = patch.username.slice(0, 1000);
+      if (typeof patch.password === "string") out.password = patch.password.slice(0, 5000);
+    }
     if (out.title != null) out.title = String(out.title).slice(0, 500);
     if (out.text != null) out.text = String(out.text);
     if (out.tags) out.tags = [...new Set((out.tags as unknown[]).map((t) => String(t).trim().replace(/^#/, "")).filter(Boolean))].slice(0, 50);
@@ -590,7 +847,7 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
   /** Validate a new note from a plug-in and turn it into note data. */
   const buildNew = (sid: string, input: Partial<PlainNote> & { boardId?: string | null }) => {
     const owned = typeof input.type === "string" ? ownedField(input.type, p.id) : null;
-    const type: NoteType = owned ? input.type! : input.type === "link" ? "link" : "text";
+    const type: NoteType = owned ? input.type! : input.type === "link" ? "link" : input.type === "password" && p.permissions.includes("passwords") ? "password" : "text";
     const now = Date.now();
     const created = typeof input.created === "number" && input.created > 0 && input.created <= now + 86_400_000 ? input.created : now;
     // imports may keep the original "last edited" time (Scute 1.17.0)
@@ -623,7 +880,7 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
 
   const scute = {
     version: APP_VERSION,
-    apiVersion: 10,
+    apiVersion: 13,
     plugin: { id: p.id, name: p.name, version: p.version, permissions: [...p.permissions] },
 
     commands: {
@@ -904,20 +1161,28 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
         await vRef.current.saveNotesBulk(spaceId, items.map((i) => ({ id: i.id!, boardId: i.boardId, data: i.data })), prog);
         return items.map((i) => i.id!);
       },
-      async update(id: string, patch: Partial<PlainNote> & { boardId?: string | null }) {
+      async update(id: string, patch: Partial<PlainNote> & { boardId?: string | null; spaceId?: string }) {
         need("notes:write");
         const n = findNote(id);
         if (!n) throw new Error("Note not found");
         writableSpace(n.spaceId);
+        // API 11: spaceId moves the note to another space (like the Move button)
+        const to = typeof patch.spaceId === "string" && patch.spaceId !== n.spaceId ? patch.spaceId : n.spaceId;
+        if (to !== n.spaceId) writableSpace(to);
         const data: NoteData = { ...n.data, ...cleanPatch(patch), modified: Date.now() };
+        if (to !== n.spaceId) delete (data as any).joplin;
         const field = ownedField(n.data.type, p.id);
         if (patch.data !== undefined) {
           if (field) (data as any)[field] = structuredCloneSafe(patch.data);
           else data.ext = { ...(n.data.ext || {}), [p.id]: structuredCloneSafe(patch.data) };
         }
-        const boardId = patch.boardId !== undefined ? patch.boardId : n.boardId;
-        await vRef.current.saveNote({ id, spaceId: n.spaceId, boardId, data });
-        recent.set(id, toPlain({ ...n, boardId, data }, p.id));
+        let boardId = patch.boardId !== undefined ? patch.boardId : to !== n.spaceId ? null : n.boardId;
+        if (boardId && !vRef.current.boards.some((x) => x.id === boardId && x.spaceId === to)) {
+          if (patch.boardId !== undefined) throw new Error("That board isn't in that space");
+          boardId = null;
+        }
+        await vRef.current.saveNote({ id, spaceId: to, boardId, data });
+        recent.set(id, toPlain({ ...n, spaceId: to, boardId, data }, p.id));
       },
       async delete(id: string) {
         need("notes:write");
@@ -926,6 +1191,23 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
         writableSpace(n.spaceId);
         recent.delete(id);
         await vRef.current.deleteNote(id);
+      },
+      /** API 11: move notes to another space or board (like the Move button). */
+      async move(ids: string[], to: { spaceId: string; boardId?: string | null }) {
+        need("notes:write");
+        if (!Array.isArray(ids)) throw new Error("notes.move needs an array of note ids");
+        writableSpace(to?.spaceId);
+        const failed: { title: string; error: string }[] = [];
+        let moved = 0;
+        for (const id of ids) {
+          try {
+            await scute.notes.update(id, { spaceId: to.spaceId, boardId: to.boardId ?? null });
+            moved++;
+          } catch (e) {
+            failed.push({ title: findNote(id)?.data.title || id, error: (e as Error).message });
+          }
+        }
+        return { moved, failed };
       },
       open(id: string) {
         bridge.openNote(id);
@@ -1038,6 +1320,11 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
      */
     drive: driveApi(() => need("drive")),
     /**
+     * API 12 (library): ebooks, magazines and comics kept as ordinary files on the
+     * server, with their details, and served to e-reader apps over OPDS at /opds/.
+     */
+    library: libraryApi(() => need("library")),
+    /**
      * API 9 (inbox): web addresses other apps send data to (OwnTracks, Overland,
      * GPSLogger…). The server seals each request to your public key on arrival;
      * fetch() opens them here. Store what you need, then ack() so the server forgets them.
@@ -1106,7 +1393,7 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
       },
       async token() {
         need("fediverse");
-        const r = await api<{ token: string; url: string }>("POST", "/api/fedi/token");
+        const r = await api<{ token: string; url: string }>("POST", "/api/fedi/token", { plugin: p.id });
         return { ...r, api: new URL(`${API_BASE}/`, location.href).href.replace(/\/$/, "") };
       },
       async apps() {
@@ -1120,6 +1407,82 @@ function makeApi(p: PluginInfo, vRef: { current: Vault }, disposers: (() => void
       async deleteAccount(confirm: string) {
         need("fediverse");
         await api("POST", "/api/fedi/account/delete", { confirm });
+      },
+    },
+    /**
+     * API 11 (bitwarden): the user's account on the Bitwarden-compatible server at <scute>/bw.
+     * The server only stores ciphertext; the plug-in does the Bitwarden encryption.
+     */
+    bitwarden: {
+      async info() {
+        need("bitwarden");
+        return api<any>("GET", "/api/bitwarden");
+      },
+      async createAccount(body: { email: string; name?: string; masterPasswordHash: string; key: string; publicKey: string; privateKey: string; kdf: { kdfType: number; iterations: number; memory?: number | null; parallelism?: number | null } }) {
+        need("bitwarden");
+        return api<any>("POST", "/api/bitwarden/account", body);
+      },
+      async updateAccount(patch: { name?: string }) {
+        need("bitwarden");
+        return api<any>("PATCH", "/api/bitwarden/account", patch);
+      },
+      async deleteAccount(confirm: string) {
+        need("bitwarden");
+        await api("POST", "/api/bitwarden/account/delete", { confirm });
+      },
+      async signOutAll() {
+        need("bitwarden");
+        await api("POST", "/api/bitwarden/sign-out", {});
+      },
+      async removeDevice(id: string) {
+        need("bitwarden");
+        await api("DELETE", `/api/bitwarden/devices/${encodeURIComponent(id)}`);
+      },
+      async vault() {
+        need("bitwarden");
+        return api<{ accountId: string; revision: number; ciphers: any[]; folders: any[] }>("GET", "/api/bitwarden/vault");
+      },
+      async putCipher(id: string, body: { cipher: unknown; mirror?: unknown; expect: number | null; deleted?: boolean }) {
+        need("bitwarden");
+        return api<any>("PUT", `/api/bitwarden/ciphers/${encodeURIComponent(id)}`, body);
+      },
+      async setCipherMirror(id: string, mirror: unknown, expect?: number) {
+        need("bitwarden");
+        return api<{ ok: boolean; revision: number }>("POST", `/api/bitwarden/ciphers/${encodeURIComponent(id)}/mirror`, { mirror, expect });
+      },
+      async trashCipher(id: string, opts: { expect?: number; mirror?: unknown } = {}) {
+        need("bitwarden");
+        return api<any>("POST", `/api/bitwarden/ciphers/${encodeURIComponent(id)}/trash`, opts);
+      },
+      async deleteCipher(id: string) {
+        need("bitwarden");
+        await api("DELETE", `/api/bitwarden/ciphers/${encodeURIComponent(id)}`);
+      },
+      async putFolder(id: string, body: { name: string; mirror?: unknown }) {
+        need("bitwarden");
+        return api<any>("PUT", `/api/bitwarden/folders/${encodeURIComponent(id)}`, body);
+      },
+      async setFolderMirror(id: string, mirror: unknown) {
+        need("bitwarden");
+        await api("POST", `/api/bitwarden/folders/${encodeURIComponent(id)}/mirror`, { mirror });
+      },
+      async deleteFolder(id: string) {
+        need("bitwarden");
+        await api("DELETE", `/api/bitwarden/folders/${encodeURIComponent(id)}`);
+      },
+      async lock(holder: string, opts: { ttl?: number; release?: boolean } = {}) {
+        need("bitwarden");
+        return api<{ ok: boolean; holder: string | null; until: number | null }>("POST", "/api/bitwarden/lock", { holder, ...opts });
+      },
+      /** Called when a Bitwarden app changed the vault (while this page is open). */
+      onChange(cb: () => void) {
+        need("bitwarden");
+        const fn = guard(p.id, "bitwarden change", cb, undefined);
+        const h = () => void fn();
+        window.addEventListener("scute:bitwarden", h);
+        const off = () => window.removeEventListener("scute:bitwarden", h);
+        disposers.push(off);
+        return off;
       },
     },
     storage: {

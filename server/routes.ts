@@ -20,11 +20,19 @@ import { NET_ON, PLUGINS_ON, registerPluginRoutes } from "./plugins";
 import { WEB_ON, registerWebRoutes } from "./web";
 import { SHARES_ON, registerShareRoutes, removeUserShares } from "./shares";
 import { registerDriveRoutes, removeUserDrive } from "./drive";
+import { registerLibraryRoutes, removeUserLibrary, LIBRARY_ON } from "./library";
+import { BOOKSEARCH_MODE } from "./booksearch";
 import { initMedia, mediaOn, registerMediaRoutes } from "./media";
 import { INBOX_ON, registerInboxRoutes } from "./inbox";
 import { FEDI_ON, registerFediRoutes, removeUserFedi } from "./fedi";
+import { BW_ON, registerBitwardenRoutes, removeUserBitwarden } from "./bitwarden";
+import { eventStream, spaceChanged, userChanged } from "./events";
+import { LINKS_ON, registerLinkRoutes, startLinks } from "./joplin-link";
 
 const VERSION = APP_VERSION;
+// Most a single /api/sync reply carries; the client asks again until "more" is false
+const SYNC_BATCH_BYTES = Math.max(1, Number(process.env.SCUTE_SYNC_BATCH_MB) || 24) * 1024 * 1024;
+const SYNC_BATCH_ROWS = Math.max(50, Number(process.env.SCUTE_SYNC_BATCH_ROWS) || 2000) | 0;
 const REGISTRATION = (process.env.SCUTE_REGISTRATION || "open").toLowerCase(); // open | closed
 const MAX_UPLOAD_MB = Number(process.env.SCUTE_MAX_UPLOAD_MB || 200);
 const SESSION_DAYS = Number(process.env.SCUTE_SESSION_DAYS || 90);
@@ -35,7 +43,7 @@ const JOPLIN_URLS = (process.env.SCUTE_JOPLIN_URLS || "")
   .split(/[\s,]+/)
   .map((x) => x.trim().replace(/\/+$/, ""))
   .filter(Boolean);
-const CLIENT_EXTRAS = JOPLIN ? ["joplin"] : [];
+const CLIENT_EXTRAS = [...(JOPLIN ? ["joplin"] : []), ...(LINKS_ON ? ["joplin-links"] : []), "events", ...(BW_ON ? ["bitwarden"] : [])];
 
 // ---------- helpers ----------
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
@@ -148,6 +156,7 @@ function requireRole(spaceId: string, userId: string, min: Role): MemberRow {
 }
 function touchSpace(spaceId: string) {
   db.prepare("UPDATE spaces SET seq = ? WHERE id = ?").run(nextSeq(), spaceId);
+  spaceChanged(spaceId);
 }
 
 const wrap =
@@ -204,7 +213,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       version: VERSION,
       registration: users === 0 ? "open" : REGISTRATION,
       maxUploadMb: MAX_UPLOAD_MB,
-      features: ["video", "multi-upload", "slideshow", "video-thumbnails", "default-space", ...(JOPLIN ? ["joplin"] : []), ...(PLUGINS_ON ? ["plugins"] : []), ...(NET_ON ? ["plugin-net"] : []), ...(WEB_ON ? ["web-archive", "bookmark-previews"] : []), ...(mediaOn() ? ["media-download"] : []), ...(SHARES_ON ? ["shares"] : []), ...(INBOX_ON ? ["inbox"] : []), ...(FEDI_ON ? ["fediverse"] : [])],
+      features: ["video", "multi-upload", "slideshow", "video-thumbnails", "default-space", "events", ...(JOPLIN ? ["joplin"] : []), ...(LINKS_ON ? ["joplin-links"] : []), ...(PLUGINS_ON ? ["plugins"] : []), ...(NET_ON ? ["plugin-net"] : []), ...(WEB_ON ? ["web-archive", "bookmark-previews"] : []), ...(mediaOn() ? ["media-download"] : []), ...(SHARES_ON ? ["shares"] : []), ...(INBOX_ON ? ["inbox"] : []), ...(FEDI_ON ? ["fediverse"] : []), ...(BW_ON ? ["bitwarden"] : []), ...(LIBRARY_ON ? ["library", "opds"] : []), ...(LIBRARY_ON && BOOKSEARCH_MODE !== "off" ? ["book-search"] : [])],
       hasUsers: users > 0,
     });
   });
@@ -388,7 +397,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const owned = db.prepare("SELECT id FROM spaces WHERE owner_id = ?").all(u.id) as { id: string }[];
       removeUserShares(u.id);
       removeUserDrive(u);
+      removeUserLibrary(u);
       removeUserFedi(u.id);
+      removeUserBitwarden(u.id);
       const tx = db.transaction(() => {
         for (const s of owned) {
           const notes = db.prepare("SELECT id FROM notes WHERE space_id = ? AND file_size IS NOT NULL").all(s.id) as {
@@ -450,17 +461,50 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
             )
             .all(...ids) as unknown[])
         : [];
-      const boards: unknown[] = [];
-      const notes: unknown[] = [];
-      const bStmt = db.prepare("SELECT id, space_id, data, deleted, seq FROM boards WHERE space_id = ? AND seq > ?");
-      const nStmt = db.prepare(
-        "SELECT id, space_id, board_id, enc_key, data, file_size, deleted, seq FROM notes WHERE space_id = ? AND seq > ?",
-      );
+      // 1.23.1: clients that send batch=1 get the changes in seq order, about SYNC_BATCH_BYTES
+      // at a time. One reply with everything can pass JavaScript's largest string after a big
+      // import. A batch ends on a seq boundary; the client asks again with after=<that seq>
+      // (keeping its since) until "more" is false. Other clients get one reply, as before.
+      const asked = req.query.batch === "1";
+      // Older clients (Scute Notes for Joplin 1.0) only know since/seq. They're batched too when
+      // that's safe: no whole space to send, so the batch's last seq works as their next since.
+      const batch = asked || !spaces.some((s) => s.mseq > since);
+      const after = asked ? Math.max(0, Number(req.query.after || 0) | 0) : 0;
+      type Row = { seq: number; data: string | null };
+      const lim = batch ? " ORDER BY seq LIMIT " + SYNC_BATCH_ROWS : "";
+      const bStmt = db.prepare("SELECT id, space_id, data, deleted, seq FROM boards WHERE space_id = ? AND seq > ?" + lim);
+      const nStmt = db.prepare("SELECT id, space_id, board_id, enc_key, data, file_size, deleted, seq FROM notes WHERE space_id = ? AND seq > ?" + lim);
+      let cap = Infinity; // nothing above this seq may be sent: some list was cut short there
+      const cand: { kind: "b" | "n"; row: Row }[] = [];
       for (const s of spaces) {
         // if membership changed after the client's cursor, send the whole space
-        const eff = s.mseq > since ? 0 : since;
-        for (const b of bStmt.all(s.id, eff)) boards.push(b);
-        for (const n of nStmt.all(s.id, eff)) notes.push(n);
+        const eff = Math.max(s.mseq > since ? 0 : since, after);
+        const bs = bStmt.all(s.id, eff) as Row[];
+        const ns = nStmt.all(s.id, eff) as Row[];
+        if (batch && bs.length === SYNC_BATCH_ROWS) cap = Math.min(cap, bs[bs.length - 1].seq);
+        if (batch && ns.length === SYNC_BATCH_ROWS) cap = Math.min(cap, ns[ns.length - 1].seq);
+        for (const row of bs) cand.push({ kind: "b", row });
+        for (const row of ns) cand.push({ kind: "n", row });
+      }
+      const boards: unknown[] = [];
+      const notes: unknown[] = [];
+      let last = after;
+      let more = false;
+      if (!batch) {
+        for (const c of cand) (c.kind === "b" ? boards : notes).push(c.row);
+      } else {
+        cand.sort((a, b) => a.row.seq - b.row.seq);
+        let bytes = 0;
+        for (const c of cand) {
+          if (c.row.seq > cap || (bytes >= SYNC_BATCH_BYTES && boards.length + notes.length > 0)) {
+            more = true;
+            break;
+          }
+          bytes += (c.row.data?.length || 0) + 300;
+          last = c.row.seq;
+          (c.kind === "b" ? boards : notes).push(c.row);
+        }
+        if (cap !== Infinity) more = true;
       }
       const invites = db
         .prepare(
@@ -470,8 +514,9 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         )
         .all(uid);
       res.json({
-        seq,
-        full: since === 0,
+        seq: !more ? seq : asked ? since : last,
+        ...(asked ? { more, after: last } : {}),
+        full: since === 0 && after === 0,
         extras: CLIENT_EXTRAS,
         settings: req.user.enc_settings,
         spaces: spaces.map(({ mseq, ...s }) => s),
@@ -503,6 +548,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       } else {
         requireRole(id, req.user.id, "admin");
         db.prepare("UPDATE spaces SET data = ?, seq = ? WHERE id = ?").run(body.data, seq, id);
+        spaceChanged(id);
       }
       res.json({ ok: true, seq });
     }),
@@ -517,9 +563,11 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       const files = db.prepare("SELECT id FROM notes WHERE space_id = ? AND file_size IS NOT NULL").all(id) as {
         id: string;
       }[];
+      const who = db.prepare("SELECT user_id FROM members WHERE space_id = ?").all(id) as { user_id: string }[];
       db.prepare("DELETE FROM spaces WHERE id = ?").run(id);
       files.forEach((f) => removeFile(f.id));
       nextSeq();
+      who.forEach((m) => userChanged(m.user_id));
       res.json({ ok: true });
     }),
   );
@@ -553,6 +601,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         ).run(id, target, body.role, "pending", body.encKey, req.user.id, seq);
       }
       touchSpace(id);
+      userChanged(target);
       res.json({ ok: true });
     }),
   );
@@ -574,6 +623,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       }
       db.prepare("DELETE FROM members WHERE space_id = ? AND user_id = ?").run(id, target);
       touchSpace(id);
+      userChanged(target);
       res.json({ ok: true });
     }),
   );
@@ -607,6 +657,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         `INSERT INTO boards (id, space_id, data, deleted, seq) VALUES (?,?,?,0,?)
          ON CONFLICT(id) DO UPDATE SET space_id = excluded.space_id, data = excluded.data, deleted = 0, seq = excluded.seq`,
       ).run(id, body.spaceId, body.data, seq);
+      spaceChanged(body.spaceId);
+      if (existing && existing.space_id !== body.spaceId) spaceChanged(existing.space_id);
       res.json({ ok: true, seq });
     }),
   );
@@ -623,6 +675,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       db.prepare("UPDATE boards SET deleted = 1, data = NULL, seq = ? WHERE id = ?").run(seq, id);
       // notes on the board stay, just unassigned
       db.prepare("UPDATE notes SET board_id = NULL, seq = ? WHERE board_id = ? AND deleted = 0").run(seq, id);
+      spaceChanged(b.space_id);
       res.json({ ok: true, seq });
     }),
   );
@@ -654,6 +707,8 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
          ON CONFLICT(id) DO UPDATE SET space_id = excluded.space_id, board_id = excluded.board_id,
            enc_key = excluded.enc_key, data = excluded.data, deleted = 0, seq = excluded.seq`,
       ).run(id, body.spaceId, body.boardId ?? null, body.encKey, body.data, existing?.file_size ?? null, seq);
+      spaceChanged(body.spaceId);
+      if (existing && existing.space_id !== body.spaceId) spaceChanged(existing.space_id);
       res.json({ ok: true, seq });
     }),
   );
@@ -671,6 +726,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
         "UPDATE notes SET deleted = 1, data = NULL, enc_key = NULL, board_id = NULL, file_size = NULL, seq = ? WHERE id = ?",
       ).run(seq, id);
       removeFile(id);
+      spaceChanged(n.space_id);
       res.json({ ok: true, seq });
     }),
   );
@@ -692,6 +748,7 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
       fs.writeFileSync(filePath(id), buf);
       const seq = nextSeq();
       db.prepare("UPDATE notes SET file_size = ?, seq = ? WHERE id = ?").run(buf.length, seq, id);
+      spaceChanged(n.space_id);
       res.json({ ok: true, seq, size: buf.length });
     }),
   );
@@ -775,6 +832,13 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
     }),
   );
 
+  // ---------- change notifications ----------
+  app.get("/api/events", auth, (req, res) => eventStream(req as AuthedReq, res));
+
+  // ---------- Joplin notebook links ----------
+  registerLinkRoutes(app, { auth, wrap, HttpError, requireRole, parse } as any);
+  startLinks();
+
   // ---------- plug-ins ----------
   registerPluginRoutes(app, { auth, wrap, HttpError });
   registerWebRoutes(app, { auth, wrap, HttpError } as any);
@@ -782,8 +846,10 @@ export async function registerRoutes(httpServer: Server, app: Express): Promise<
   registerMediaRoutes(app, { auth, wrap, HttpError } as any);
   registerShareRoutes(app, { auth, wrap, HttpError } as any);
   registerDriveRoutes(app, { auth, wrap, HttpError, sessionUser } as any);
+  registerLibraryRoutes(app, { auth, wrap, HttpError, sessionUser } as any);
   registerInboxRoutes(app, { auth, wrap, HttpError } as any);
   registerFediRoutes(app, httpServer, { auth, wrap, HttpError, checkLogin, kdfParams } as any);
+  registerBitwardenRoutes(app, httpServer, { auth, wrap, HttpError } as any);
 
   // JSON errors for the API
   app.use("/api", (err: any, _req: Request, res: Response, next: NextFunction) => {

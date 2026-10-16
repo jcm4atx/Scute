@@ -15,10 +15,14 @@ A self-hosted, end-to-end encrypted home for notes, bookmarks, passwords, images
 - **Hidden spaces**: keep sensitive spaces out of sight on your devices, optionally behind your password or a PIN.
 - **Sharing**: invite other users on your server to a space as admin, member (read/write) or guest (read-only). Keys are sealed to the invitee's public key in the browser.
 - **Offline-first PWA**: installable on desktop and mobile, service-worker app shell, encrypted local cache, and an outbox that syncs changes when you're back online. Share target: share a link from your phone straight into Scute.
+- **Joplin notebook links**: keep a Joplin notebook and an ordinary space in sync all the time, run by the server, with many notebook/space pairs.
+- **Live updates**: changes from other devices and members appear in open windows right away.
 - **Joplin Server sync**: a space can be linked to a self-hosted Joplin Server account and stay in two-way sync with the Joplin desktop and mobile apps (notebooks, notes, tags, to-dos, images and attachments).
 - **Scute Drive**: a private cloud folder of ordinary files on your server, synced two ways with Linux (rclone) and Android over WebDAV, with a web file browser, trash and per-device app passwords (with the Scute Drive plug-in).
+- **Ebook library and OPDS server**: keep your ebooks, magazines and comics on your server and read them in KOReader, Thorium, Moon+ Reader, Librera, Panels and other OPDS apps, with details and covers filled in from the files and from Open Library, Google Books and the Internet Archive, and Find books to search and fetch books from IRC book servers such as IRCHighway's #ebooks (with the Library plug-in).
 - **Inbox for other apps**: phone apps such as OwnTracks can send your location (or other data) to a private address; Scute seals it with your key as it arrives and the Location history plug-in turns it into encrypted notes and a travel dashboard.
 - **Fediverse server**: your own Mastodon-compatible account (`@you@your.domain`) served by Scute. Follow and be followed from Mastodon, Pixelfed, Misskey and the rest, share posts and any kind of file, and use Mastodon apps such as Tusky, Ivory, Elk or Phanpy (with the Fediverse plug-in).
+- **Bitwarden apps**: use the official Bitwarden browser extension, desktop, mobile and command-line apps with Scute as their self-hosted server, end-to-end encrypted, with logins kept in sync with your Scute password notes (with the Bitwarden plug-in).
 - **Plug-ins**: add your own commands, note buttons, views, templates and Markdown syntax with small JavaScript plug-ins. Four examples are included (daily note, wiki links, word count, space stats).
 - **Import/export**: decrypted JSON export (with or without attachments), import of Scute exports and best-effort import of Turtl JSON backups.
 - **Tiny footprint**: one Node.js process and one SQLite file. No Postgres, no Redis.
@@ -175,6 +179,34 @@ Notes you create in Scute go the other way: text notes and bookmarks become Jopl
 - Joplin's own "conflicts" notebook and note revision history aren't imported. Very large Joplin libraries take a while on the first sync (every item is downloaded once per browser).
 - Limit which Joplin servers can be used with `SCUTE_JOPLIN_URLS`, or turn the feature off with `SCUTE_JOPLIN=off` (see Configuration).
 
+## Joplin notebook links
+
+A Joplin space (above) mirrors a whole Joplin account and syncs while you have it open. A **notebook link** instead keeps one notebook in sync with an ordinary, encrypted space, all the time, even when nobody is signed in. You can have as many links as you like, each pairing one notebook with one space (several can use the same Joplin account).
+
+**Set it up**
+
+1. Switch to the space, open the space switcher → **Sync with a Joplin notebook…** (owners and admins only).
+2. Enter your Joplin Server URL, email and password and click **Find notebooks**.
+3. Pick the notebook (notebooks already linked to another space are greyed out), choose how often Scute checks Joplin for changes, and click **Start syncing**.
+
+A bar above the notes shows the link and its state, with **Sync now** and a settings button (pause, check interval, new password, **Stop syncing**).
+
+**How it works**
+
+- Notes in the notebook become notes in the space; its sub-notebooks (at any depth) become boards, and tags stay tags. Notes already in the space are sent to the notebook on the first sync.
+- Images and files attached to a Joplin note show inline in the note and also appear as their own image, video or file notes (with thumbnails); images, videos and files you add in Scute become Joplin resources.
+- Changes made in Scute reach Joplin Server within a couple of seconds. Joplin is checked every 5 seconds to 15 minutes (10 seconds by default); the Joplin apps pick up changes on their own sync schedule. Open Scute windows update right away.
+- If a note changed in both places, Joplin's version wins and yours is kept as "… (conflict copy)".
+- Deleting in Scute moves the item to Joplin's trash; deleting, trashing or moving a note out of the notebook in Joplin removes it from the space. Moving a note between two spaces linked to the same Joplin account moves it between the notebooks.
+- If one check would remove more than 25 notes and over half the space, the link pauses and asks before going ahead. If the notebook itself is deleted, the link pauses.
+- Password notes are never sent to Joplin. Joplin's own encryption must be off for the account.
+
+**Privacy**: to sync while nobody is signed in, the Scute server keeps a copy of a linked space's key (sealed with a server key in `$SCUTE_DATA_DIR/link-key.json`, mode 600), so the server can read linked spaces. Other spaces stay end-to-end encrypted. Stopping the sync deletes the server's copy. Keep `link-key.json` with your backups and as private as `scute.db`; The link settings, including the Joplin password, are stored encrypted with the space key.
+
+**Settings**: `SCUTE_JOPLIN_LINKS=off` turns links off (as does `SCUTE_JOPLIN=off`); `SCUTE_JOPLIN_URLS` limits which Joplin servers can be used. The Scute server (the container) must be able to reach the Joplin URL.
+
+**Behind a proxy**: live updates use a long-lived event stream at `/api/events`. Scute already sends `Cache-Control: no-transform` and `X-Accel-Buffering: no`; if updates only appear after a delay behind Apache, turn off compression for that path, for example `SetEnvIf Request_URI "/api/events" no-gzip=1`. Without the stream Scute still syncs normally, just not instantly.
+
 ## Plug-ins
 
 Plug-ins add features without changing Scute itself: commands (the puzzle-piece menu in the header, with optional shortcuts), buttons on open notes, full-page views in the sidebar, New-menu templates, badges on cards, extra Markdown syntax, and (API 2) their own kinds of spaces and note types.
@@ -250,6 +282,24 @@ Things to know:
 - **Under a path** (`https://example.com/scute/`): also send the path, so the addresses in WebDAV answers are right. In the `<Location /scute/>` block add `RequestHeader set X-Forwarded-Prefix "/scute"` (`a2enmod headers`), or set `SCUTE_BASE_PATH=/scute`. Devices then use `https://example.com/scute/dav/`.
 - Wrong app passwords are slowed down per address and username after 20 tries in 15 minutes; set `SCUTE_TRUST_PROXY=1` behind a proxy so that's the real address. `SCUTE_DRIVE=off` turns the drive off (it's also off when plug-ins are off).
 
+## Library and OPDS
+
+Since 1.24.0 Scute can keep your ebooks, magazines and comics and serve them to e-reader apps as an **OPDS catalog**, like Calibre's content server or COPS. Install the **Library** plug-in (in scute-extras) to upload books, edit their details and make app passwords; the catalog itself is part of Scute.
+
+- **Books are ordinary files on the server**, not encrypted, because reading apps can't decrypt Scute's notes. They're in `$SCUTE_LIBRARY_DIR/<user id>/<book id>/` (with Docker, `./data/library/…`), one folder per book holding `book.epub`, `book.pdf` and so on plus `cover.jpg`; titles, authors and the rest are in the database. Downloads are named "Author - Title.epub".
+- **The catalog** is at `https://notes.example.com/opds/` (under a path, `https://example.com/scute/opds/`; send `X-Forwarded-Prefix` as for Scute Drive). Sign in with your Scute username and a **Library app password** made in the plug-in (never your Scute password). It has Recently added, All by title, Authors, Series, Subjects, Languages, Magazines and Comics, plus search, 50 books a page.
+- OPDS 1.2 apps that can sign in include KOReader, Thorium Reader, Moon+ Reader, Librera, FBReader, Foliate, KyBook, and Panels and Chunky for comics. Kobo and Kindle e-readers have no OPDS client of their own; KOReader runs on both.
+- Details come from the files (EPUB, MOBI/AZW3, FB2, CBZ with ComicInfo.xml, PDF) and, when you ask, from Open Library, Google Books and the Internet Archive. Those lookups go from your browser, or through the server's fetcher when the browser can't reach a site (`SCUTE_ARCHIVE` on).
+- Uploads are streamed to disk, so allow big bodies as for Scute Drive (Apache `LimitRequestBody 0`, nginx `client_max_body_size 0`). `SCUTE_LIBRARY=off` turns it off (it's also off when plug-ins are off).
+
+### Find books (IRC)
+
+Since 1.25.0 the Library can search IRC book servers and fetch what you pick, the way [OpenBooks](https://github.com/evan-buss/openbooks) does. **Find books** in the Library plug-in searches `#ebooks` on IRCHighway. The server joins the channel under your nickname (your Scute username unless you set one in the Library's settings) and sends `@search …`. It reads the results file the search bot sends back, then asks the chosen server (`!Oatmeal …`) for the book. Each file arrives by DCC and the plug-in adds it to your library like an upload, unpacking `.zip` and `.rar` files and filling in details.
+
+- Only the server admin can use it, unless `SCUTE_BOOKSEARCH=all`; `off` turns it off. `SCUTE_BOOKSEARCH_SERVER` (default `irc.irchighway.net:6697`, TLS), `SCUTE_BOOKSEARCH_CHANNEL` (`#ebooks`) and `SCUTE_BOOKSEARCH_BOT` (`search`) point it elsewhere.
+- Nothing needs opening on your router or proxy. Scute connects out to the IRC server, and for each DCC transfer to the address the book server gives (any port). DCC offers that point at private or local addresses are refused. At most three people search at once, and each connection closes after ten idle minutes.
+- The books come from other people's servers. Download only what you're allowed to: public-domain works, books you own, or ones shared with permission.
+
 ## Inbox: data from other apps
 
 Since 1.19.0 other apps can send data to Scute, for example your phone sending its location with OwnTracks, Overland, GPSLogger or Traccar Client. Install the **Location history** plug-in (in scute-extras) to use it; the plug-in makes the addresses and shows how to set each app up.
@@ -288,6 +338,18 @@ Since 1.20.0 Scute can be a small Fediverse server, like a one-person Mastodon. 
 - Scute signs its lookups on other servers with a server key (the actor at `https://<domain>/instance-actor`; `/actor` before 1.20.2). If a server refuses it, for example because it still remembers an earlier program on the same domain, Scute retries with the first account's own key.
 - Deliveries to other servers are queued and retried with backoff for about three days. `SCUTE_FEDI=off` turns the Fediverse off again without losing anything; it's also off when plug-ins are off.
 
+## Bitwarden apps
+
+Since 1.22.0 Scute is also a server for the official **Bitwarden** apps (browser extensions, desktop, iOS, Android and the `bw` command line), so they can fill in your passwords everywhere. It speaks the same API as Bitwarden's own server (like Vaultwarden does), at `<your Scute address>/bw`.
+
+- **Setting up**: install the **Bitwarden** plug-in (in scute-extras) and open it from the menu. Choose an email address and a Bitwarden master password; the plug-in makes the account's keys in your browser. Then in each Bitwarden app, on the sign-in screen pick **Self-hosted** and enter the server URL the plug-in shows, e.g. `https://jcm.guru/scute/bw`, and sign in with that email and master password.
+- **Kept in sync with Scute**: the plug-in mirrors Bitwarden logins and your Scute password notes both ways, in the spaces you choose (Bitwarden folders are named after spaces and boards). Everything else (cards, identities, SSH keys, attachments, one-time-code secrets, extra fields) stays in Bitwarden. The mirroring runs in the browser, so changes made in a Bitwarden app reach Scute's notes the next time Scute is open in a browser; the Bitwarden apps themselves see each other's changes at once.
+- **Privacy**: the apps encrypt everything with your account key before sending it, and the plug-in does the same, so the server stores only ciphertext (in the `bw_*` tables of `scute.db` and `$SCUTE_DATA_DIR/bitwarden/`). The master password never leaves your devices; the server keeps a slow hash of a hash of it. Losing the master password loses the Bitwarden vault (the Scute password notes are not affected).
+- **What isn't there**: organizations and sharing, Send, emergency access, two-step login, passkey or SSO sign-in, and push to the mobile apps (they sync when opened and on pull-to-refresh; the desktop apps, extensions and CLI get changes live over WebSocket). New accounts can't be made from the apps, only from the plug-in.
+- **Importing**: in a Bitwarden app, **Import data** works as with Bitwarden's own server (Bitwarden .json, including password-protected and account-encrypted exports, .csv, and the other managers' formats the apps read). Importing an export of this same account again reuses its folders instead of making new ones. Large imports are fine up to 64 MB of JSON; a proxy in front may need its own body limit raised (Apache's `LimitRequestBody` defaults to 1 GB, nginx's `client_max_body_size` to 1 MB).
+- **Proxy**: nothing extra if Scute is already proxied with WebSocket upgrades (`upgrade=websocket`), as in the example Apache and nginx configurations; `/bw/notifications/hub` is the live-update socket.
+- Website icons in the apps are fetched by the server (`/bw/icons/<domain>/icon.png`) and cached; `SCUTE_BITWARDEN_ICONS=off` turns that off. `SCUTE_BITWARDEN=off` turns the whole server off without losing anything.
+
 ## Scute in Joplin
 
 The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in scute-extras) signs in to your Scute server and shows your notes in a panel beside the editor, decrypted on your computer. You can read them, insert them into a Joplin note, copy them (with attachments) into notebooks, and send Joplin notes to Scute, encrypted. It needs Scute 1.17.0 or later and `SCUTE_API_CORS` left on. Unlike a Joplin space, nothing passes through Joplin Server and password notes stay encrypted unless you choose to copy them.
@@ -312,9 +374,11 @@ The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in s
 | `SCUTE_DATA_DIR` | `./data` | Directory for `scute.db` and encrypted files |
 | `SCUTE_REGISTRATION` | `open` | `open` or `closed` |
 | `SCUTE_MAX_UPLOAD_MB` | `200` | Maximum size of one attachment or video (after encryption). Files are decrypted in browser memory, so very large values are hard on phones. |
+| `SCUTE_SYNC_BATCH_MB` | `24` | Most data one sync reply carries; after a big import, browsers catch up in several replies |
 | `SCUTE_SESSION_DAYS` | `90` | How long a device stays signed in |
 | `SCUTE_TRUST_PROXY` | off | Set to `1` behind a reverse proxy |
-| `SCUTE_JOPLIN` | `on` | Set to `off` to disable Joplin Server sync (the relay and the space kind) |
+| `SCUTE_JOPLIN` | `on` | Set to `off` to disable Joplin Server sync (the relay and the space kind) and notebook links |
+| `SCUTE_JOPLIN_LINKS` | `on` | Set to `off` to disable always-on Joplin notebook links |
 | `SCUTE_PLUGINS` | `on` | Set to `off` to disable plug-ins entirely |
 | `SCUTE_PLUGINS_DIR` | `$SCUTE_DATA_DIR/plugins` | Where installed plug-ins live |
 | `SCUTE_PLUGIN_NET` | off | Comma-separated URL prefixes plug-ins may reach through the server (e.g. a local AI server: `http://ollama:11434`); `*` allows any. See [PLUGINS.md](PLUGINS.md#network-relay-api-3-network). |
@@ -333,6 +397,13 @@ The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in s
 | `SCUTE_DRIVE_QUOTA_GB` | `0` | Space per user in GB; `0` for no limit (the disk's free space) |
 | `SCUTE_DRIVE_MAX_FILE_GB` | `50` | Largest single file |
 | `SCUTE_DRIVE_TRASH_DAYS` | `30` | How long deleted and replaced files stay in the trash; `0` deletes at once |
+| `SCUTE_LIBRARY` | `on` | Set to `off` to disable the ebook library and its OPDS catalog (`/opds/`); also off when plug-ins are off |
+| `SCUTE_LIBRARY_DIR` | `$SCUTE_DATA_DIR/library` | Where the library keeps books, one folder per user and book |
+| `SCUTE_LIBRARY_MAX_MB` | `1024` | Largest single book file (comics and scanned magazines can be big) |
+| `SCUTE_BOOKSEARCH` | `admins` | Find books on IRC: `admins`, `all` or `off` |
+| `SCUTE_BOOKSEARCH_SERVER` | `irc.irchighway.net:6697` | IRC server for Find books (TLS on 6697) |
+| `SCUTE_BOOKSEARCH_CHANNEL` | `#ebooks` | Channel the book servers are in |
+| `SCUTE_BOOKSEARCH_BOT` | `search` | Nick that answers `@search` |
 | `SCUTE_INBOX` | `on` | Set to `off` to stop other apps from sending data to Scute (`/in/…`); also off when plug-ins are off |
 | `SCUTE_INBOX_MAX_KB` | `1024` | Largest single request an app may send to the inbox |
 | `SCUTE_INBOX_MAX_ITEMS` | `200000` | Most requests waiting per inbox address before Scute answers 429 |
@@ -341,6 +412,8 @@ The **Scute Notes** plug-in for Joplin desktop (`us.mayson.scutenotes.jpl`, in s
 | `SCUTE_FEDI_USERS` | anyone | Comma-separated Scute usernames allowed a Fediverse account |
 | `SCUTE_FEDI_MAX_MB` | `100` | Largest file one Fediverse attachment may be |
 | `SCUTE_FEDI` | `on` | Set to `off` to turn the Fediverse off while keeping `SCUTE_FEDI_DOMAIN` set |
+| `SCUTE_BITWARDEN` | `on` | Set to `off` to stop serving the Bitwarden apps at `/bw` |
+| `SCUTE_BITWARDEN_ICONS` | `on` | Set to `off` so the server doesn't fetch website icons for the Bitwarden apps |
 | `SCUTE_BASE_PATH` | none | The path Scute is served under (e.g. `/scute`) when the proxy doesn't send `X-Forwarded-Prefix` |
 | `SCUTE_JOPLIN_URLS` | any | Comma-separated list of Joplin Server URLs users may connect to, e.g. `https://joplin.example.com`. Recommended on shared servers. |
 | `SCUTE_API_CORS` | `on` | Lets apps on other origins (such as the Scute Notes plug-in for Joplin) call `/api` with a Bearer token. Safe because Scute never uses cookies for the API; set to `off` to allow only the Scute web app itself. |
@@ -392,7 +465,11 @@ All endpoints are JSON under `/api`, authenticated with `Authorization: Bearer <
 - `GET /api/shares[?plugin=]`, `GET|PATCH|DELETE /api/shares/:slug`, `POST /api/shares/:slug/begin`, `PUT /api/shares/:slug/:version/<file>`, `POST /api/shares/:slug/:version/commit` — published shares; public pages and files are at `/shared/<slug>/…` (no login)
 - `GET|POST /api/inbox?plugin=`, `PATCH|DELETE /api/inbox/:id`, `GET /api/inbox-items?plugin=&after=&limit=`, `POST /api/inbox-items/delete` — inbox addresses and the sealed requests waiting in them; apps send to `/in/<id>[/<password>]` (no login, any method)
 - `GET /api/fedi`, `POST /api/fedi/account`, `POST /api/fedi/token`, `GET /api/fedi/apps`, `DELETE /api/fedi/apps/:id`, `POST /api/fedi/account/delete` — the signed-in user's Fediverse account; the Mastodon client API (`/api/v1/…`, `/api/v2/…`, `/oauth/…`) and ActivityPub (`/.well-known/webfinger`, `/users/<name>`, `/inbox`) are served on both the Scute address and the Fediverse domain
+- `GET /api/bitwarden`, `POST|PATCH /api/bitwarden/account`, `POST /api/bitwarden/account/delete`, `POST /api/bitwarden/sign-out`, `DELETE /api/bitwarden/devices/:id`, `GET /api/bitwarden/vault`, `PUT|DELETE /api/bitwarden/ciphers/:id`, `POST /api/bitwarden/ciphers/:id/mirror|trash`, `PUT|DELETE /api/bitwarden/folders/:id`, `POST /api/bitwarden/folders/:id/mirror`, `POST /api/bitwarden/lock` — the signed-in user's Bitwarden account, for the plug-in; the Bitwarden apps use `/bw/identity/…`, `/bw/api/…`, `/bw/icons/…` and `/bw/notifications/hub`
 - `POST /api/plugins-net` — network relay for plug-ins, limited to `SCUTE_PLUGIN_NET`
+- `GET /api/events` — event stream (server-sent events) telling open clients to sync now
+- `GET /api/links/key`, `POST /api/links/scan`, `GET /api/links/scan/:id` — server key for sealing a space key, and listing an account's notebooks
+- `GET|POST /api/links`, `PATCH|DELETE /api/links/:id`, `POST /api/links/:id/run` — Joplin notebook links (create, pause, change interval or password, stop, sync now)
 - `ANY /api/joplin/<joplin api path>` with `X-Joplin-Url` — relay to a Joplin Server's sync API
 
 ## License

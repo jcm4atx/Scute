@@ -113,6 +113,9 @@ A plug-in can have extra files (images, more modules); they're served from `/plu
 | `inbox` | API 9: `inbox.*`, addresses other apps (such as OwnTracks) send data to, and what they've sent |
 | `drive` | API 8: `drive.*`, the user's Scute Drive files (ordinary, unencrypted files on the server, also reachable over WebDAV) and its app passwords |
 | `fediverse` | API 10: `fedi.*`, the user's Fediverse account and a Mastodon-API token that can read and post as them |
+| `bitwarden` | API 11: `bitwarden.*`, the user's account on Scute's Bitwarden-compatible server (for the Bitwarden apps) |
+| `library` | API 12: `library.*` (API 13: `library.irc`, book search), the user's ebooks, magazines and comics (ordinary, unencrypted files on the server, also served over OPDS) and the app passwords for e-reader apps |
+| `passwords` | API 11: password notes include `username` and `password`, and the plug-in may set them and create password notes |
 
 A call without the permission throws an error, which Scute shows as a toast.
 
@@ -134,7 +137,7 @@ interface PlainNote {
 }
 ```
 
-Password fields and encrypted thumbnails are never included. `data` is private to your plug-in: set it with `notes.create({ data })` / `notes.update(id, { data })`; other plug-ins can't see it. It's stored encrypted inside the note.
+Password fields and encrypted thumbnails are never included, unless the plug-in has the `passwords` permission (API 11): then password notes also have `username` and `password`, `notes.create({ type: "password", username, password, ... })` works, and `notes.update` accepts them. `data` is private to your plug-in: set it with `notes.create({ data })` / `notes.update(id, { data })`; other plug-ins can't see it. It's stored encrypted inside the note.
 
 ### Context
 
@@ -261,8 +264,9 @@ await scute.boards.create({ spaceId?, title })          // → id
 scute.notes.list({ spaceId?, boardId?, type?, tag?, search? }) // spaceId "all" for every space
 scute.notes.get(id)                     // PlainNote | null
 await scute.notes.create({ id?, spaceId?, boardId?, type?: "text" | "link" | yourType, title, text, url, tags, color, pinned, data }) // → id
-await scute.notes.update(id, { title?, text?, url?, tags?, color?, pinned?, boardId?, data? })
+await scute.notes.update(id, { title?, text?, url?, tags?, color?, pinned?, boardId?, spaceId?, data? })  // spaceId (API 11) moves it to another space
 await scute.notes.delete(id)
+await scute.notes.move(ids, { spaceId, boardId? })   // API 11: like the Move button → { moved, failed }
 scute.notes.open(id)                    // show it
 ```
 
@@ -326,6 +330,40 @@ await scute.drive.tokens.list(); await scute.drive.tokens.remove(id)
 
 Errors carry `status` (404, 405, 409, 413 too big, 507 out of space). The Scute Drive plug-in in scute-extras is the complete example.
 
+### Library (API 12, `library`)
+
+The library keeps books as ordinary files on the server, one folder per book, with their details in a table, so e-reader apps can read them over OPDS at `/opds/` (signed in with the username and a Library app password). Plug-ins see it through `scute.library`; reading details out of files and looking them up online is the plug-in's job.
+
+```js
+const info = await scute.library.info()        // { enabled, username, opds: "https://notes.example.com/opds/", books, files, bytes, maxFile, formats }
+const books = await scute.library.list()       // [{ id, kind: "book"|"magazine"|"comic", title, authors, series, seriesIndex, issue, publisher, published,
+                                                //    language, isbn, identifiers, description, subjects, pages, rating, files: [{ format, name, size, sha1 }], cover, added, modified }]
+const r = await scute.library.add(file, { meta: { title, authors: ["Frank Herbert"] }, onProgress })  // { book } or { book, duplicate: { id, format } }
+await scute.library.addFile(id, pdfFile)       // another format of the same book
+await scute.library.removeFile(id, "pdf")
+await scute.library.update(id, { series: "Dune", seriesIndex: 1, subjects: ["Science fiction"] })  // only the fields you pass
+await scute.library.setCover(id, jpegBlob)     // or null to remove; about 800 px tall is plenty
+await scute.library.remove(id)
+scute.library.coverUrl(book)                   // <img src>, no sign-in needed (about a week); after list() or info()
+await scute.library.fileUrl(id, "epub")        // download link, no sign-in needed; { view: true } opens a PDF in the browser
+await scute.library.tokens.create("Kobo")      // { id, label, token }: an app password for OPDS, shown only now
+```
+
+Formats: EPUB, KEPUB, PDF, MOBI, AZW/AZW3/KFX, CBZ/CBR/CB7/CBT, FB2, DjVu, TXT, RTF, HTML, DOCX, ODT and a few older ones. Files over `SCUTE_LIBRARY_MAX_MB` get a 413. The Library plug-in in scute-extras is the complete example.
+
+API 13 adds `scute.library.irc`, a book search on IRC done by the server (IRCHighway's #ebooks unless `SCUTE_BOOKSEARCH_SERVER`/`_CHANNEL` say otherwise; only the server admin unless `SCUTE_BOOKSEARCH=all`):
+
+```js
+const st = await scute.library.irc.status()          // { enabled, allowed, server, channel, state, nick, people, online: [nicks], jobs }
+let job = await scute.library.irc.search("le guin dispossessed")
+while (!["done", "error"].includes(job.status)) { await sleep(2000); job = await scute.library.irc.job(job.id) }
+job.results  // [{ bot, command: "!Oatmeal Ursula K. Le Guin - The Dispossessed.epub", title, author, format, archive, size, sizeText }]
+let dl = await scute.library.irc.download(job.results[0].command)   // then poll job(dl.id) the same way
+const file = await scute.library.irc.file(dl.id)     // a File, perhaps a .zip or .rar holding the book
+```
+
+Jobs and their files are kept for an hour; the connection closes after ten idle minutes.
+
 ### Inbox (API 9, `inbox`)
 
 Web addresses other apps can send data to without signing in, such as a phone app sending its location. Each address belongs to the plug-in that made it. The server seals every request to the user's public key when it arrives and keeps it until a plug-in in the browser fetches it; `fetch()` opens the seal with the user's private key, so the plug-in gets the request as it was sent. Store what you need in notes, then `ack()` the items so the server deletes them.
@@ -349,7 +387,7 @@ When the server has a Fediverse domain (`SCUTE_FEDI_DOMAIN`), each user can have
 ```js
 const info = await scute.fedi.info()   // { enabled, domain, url, allowed, version, account: <Mastodon Account> | null, queue: { waiting, retrying, lastError }, api }
 await scute.fedi.createAccount({ username: "jcm", displayName: "John" })  // { account, token }
-const { token, api } = await scute.fedi.token()   // a Bearer token for this signed-in device (replaces its previous one)
+const { token, api } = await scute.fedi.token()   // a Bearer token for this signed-in device and plug-in (replaces the plug-in's previous one; 1.23.0+, before that all plug-ins on a device shared one)
 const home = await fetch(`${api}/api/v1/timelines/home`, { headers: { Authorization: `Bearer ${token}` } }).then((r) => r.json())
 await scute.fedi.apps()                // Mastodon apps signed in to the account: [{ id, name, website, created, lastUsed, scopes, scute, push }]
 await scute.fedi.revokeApp(id)
@@ -357,6 +395,24 @@ await scute.fedi.deleteAccount("jcm")  // the account name, to confirm
 ```
 
 `api` is Scute's own address (e.g. `https://example.com/scute`), so requests are same-origin; the streaming API is a WebSocket at `${api}/api/v1/streaming?stream=user&access_token=…`. Everything in the Fediverse is stored in plain form on the server; don't post the contents of encrypted notes unless the user asks. The Fediverse plug-in in scute-extras is the complete example.
+
+### Bitwarden (API 11, `bitwarden`)
+
+Scute 1.22.0 has a server the Bitwarden apps can use (`<scute>/bw`). Each Scute user can have one Bitwarden account there; it's created from a plug-in, because the keys have to be made in the browser. The server keeps only what the apps keep on Bitwarden's own servers: ciphertext, plus your plug-in's `mirror` notes on each item.
+
+```js
+const info = await scute.bitwarden.info()   // { enabled, url, version, account: { id, email, name, kdf, key, ... } | null, devices }
+await scute.bitwarden.createAccount({ email, name, masterPasswordHash, key, publicKey, privateKey, kdf: { kdfType: 0, iterations: 600000 } })
+const { ciphers, folders } = await scute.bitwarden.vault()   // ciphers as the apps see them, with revision (ms) and mirror
+await scute.bitwarden.putCipher(id, { cipher, mirror, expect })   // expect: the revision you last saw, null for new; 409 if it changed
+await scute.bitwarden.setCipherMirror(id, mirror, expect)
+await scute.bitwarden.trashCipher(id, { expect })     // to the Bitwarden trash (kept 30 days)
+await scute.bitwarden.putFolder(id, { name, mirror })
+await scute.bitwarden.lock(holder, { ttl })           // only one browser at a time: { ok }
+scute.bitwarden.onChange(() => ...)                    // an app changed something
+```
+
+`cipher` is the body a Bitwarden app sends (`{ type, name, notes, login: { username, password, uris, totp }, fields, passwordHistory, folderId, favorite, key? }`), with every string an encrypted EncString. The Bitwarden plug-in in scute-extras is the complete example, including the encryption.
 
 ### Storage (`storage`)
 
@@ -431,7 +487,7 @@ scute.ui.el("div", { class: "x", onclick: fn, style: {...} }, "text", childEl, [
 
 ### Info
 
-`scute.version` (Scute version), `scute.apiVersion` (`2` in Scute 1.7.0, `3` in 1.8.0, `4` in 1.10.0, `5` in 1.11.0, `6` in 1.12.0, `7` in 1.15.0, `8` in 1.16.0, `9` in 1.19.0, `10` in 1.20.0), `scute.plugin` (`{ id, name, version, permissions }`).
+`scute.version` (Scute version), `scute.apiVersion` (`2` in Scute 1.7.0, `3` in 1.8.0, `4` in 1.10.0, `5` in 1.11.0, `6` in 1.12.0, `7` in 1.15.0, `8` in 1.16.0, `9` in 1.19.0, `10` in 1.20.0, `11` in 1.22.0), `scute.plugin` (`{ id, name, version, permissions }`).
 
 ## Development tips
 

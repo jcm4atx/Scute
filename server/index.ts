@@ -45,6 +45,8 @@ if (!["off", "0", "false", "no"].includes((process.env.SCUTE_API_CORS || "").toL
 // WebDAV (Scute Drive) bodies are files: never parse them
 // (nor the inbox's, which keeps exactly what the sending app sent)
 const notDav = (req: any) => !/^\/(dav|in)(\/|$)/.test(req.url || "");
+// a Bitwarden import can be a whole vault in one request
+app.use("/bw/api/ciphers/import", express.json({ type: (req) => /json/i.test(String(req.headers["content-type"] || "")), limit: "64mb" }));
 app.use(
   express.json({
     type: (req) => notDav(req) && /json/i.test(String(req.headers["content-type"] || "")),
